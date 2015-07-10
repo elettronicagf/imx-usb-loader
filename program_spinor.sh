@@ -1,6 +1,8 @@
 #program_spinor.sh   
+version=1.0
 function print_usage()
 {
+	 	echo "program_spinor v.$version"
  		echo "Usage: `basename $0` bootloader_version wid"
  		echo "Example: `basename $0` 0508-001 0508aa0101"
 		exit $E_BADARGS
