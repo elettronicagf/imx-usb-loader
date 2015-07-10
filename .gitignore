@@ -9,3 +9,5 @@ imx_uart.lds
 .settings
 .cproject
 .project
+mx6_usb_work.conf
+
