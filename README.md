@@ -18,6 +18,48 @@ The utility support USB and UART as serial link.
 Two binaries are available, imx_usb and imx_uart for the two supported
 connections.
 
+### Windows
+
+Two variants have been tested successfully to build imx_usb and imx_uart
+on Windows:
+1. MinGW (using the Microsoft C runtime)
+1. Visual Studio 2015
+
+#### MinGW
+
+MinGW allows to use the GNU toolchain (including GCC) to compile a native
+Microsoft Windows application. A MinGW specific make file (Makefile.mingw)
+is available which allows to build imx_usb/imx_uart with the native make
+port (mingw32-make.exe). After installing MinGW, make sure you have a
+compiled copy of libusb available and build imx_loader using:
+
+```
+mingw32-make -f Makefile.mingw LIBUSBPATH=C:\path\to\libusb
+```
+
+This dynamically links against libusb, hence make sure to ship the
+library libusb-1.0.dll along with imx_usb.exe.
+
+#### Visual Studio
+
+The subdirectory msvc/ contains the project files for Visual Studio 2015.
+Make sure you have the Visual C++ component installed. There is one solution
+containing two projects, one for imx_usb and one for imx_uart. The imx_usb
+project requires libusb to be present at ../../libusb (relative to the msvc)
+directory. If you use an alternative location or compile libusb from source
+too, you will have to alter the include/library path in the project settings.
+
+### macOS
+
+libusb and pkg-config can be installed via Homebrew.
+
+If imx_usb fails to claim interface, com.apple.driver.usb.IOUSBHostHIDDevice
+needs to be unloaded so libusb can claim, run:
+
+```
+sudo kextunload -b com.apple.driver.usb.IOUSBHostHIDDevice
+```
+
 ## Usage
 Using USB, your device should be detected automatically using the USB
 VID/PID from imx_usb.conf. Using UART, the user has to specify a
@@ -26,7 +68,7 @@ variant for the target device (transfer configuration). The
 configuration file can also contains work item(s).
 
 Work items can also be defined using the command line. By specifying a
-file in the command line, the utilty automatically uses this file as
+file in the command line, the utility automatically uses this file as
 a work item and reads parameter from its header:
 
 ```
@@ -40,7 +82,7 @@ However, parameters can also specified manually, e.g.
 ```
 
 The UART link uses hardware flow control using RTS/CTS, so make sure
-those are available. The imx_uart utilty will configure the target
+those are available. The imx_uart utility will configure the target
 tty with the right baud rate (115200) and flow control settings:
 
 ```

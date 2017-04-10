@@ -22,27 +22,12 @@
 #include <sys/types.h>
 #include <time.h>
 
-#ifndef WIN32
-#include <unistd.h>
-#else
-#include <Windows.h>
-#endif
 #include <ctype.h>
-#ifndef WIN32
-#include <sys/io.h>
-#else
-#include <io.h>
-#endif
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
-
-#ifndef WIN32
 #include <getopt.h>
-#else
-#include "getopt.h"	// use local re-implementation of getopt
-#endif
 
 #include <fcntl.h>
 
@@ -50,17 +35,12 @@
 #include <termios.h>
 
 #include <sys/ioctl.h>
-#include <linux/serial.h>
-#else
-
-#define open(filename,oflag)	_open(filename,oflag)
-#define write(fd,buffer,count)	_write(fd,buffer,count)
-#define read(fd,buffer,count)	_read(fd,buffer,count)
-#define close(fd)				_close(fd)
-
 #endif
 
+#include "portable.h"
 #include "imx_sdp.h"
+
+extern int debugmode;
 
 #define get_min(a, b) (((a) < (b)) ? (a) : (b))
 
@@ -91,17 +71,16 @@ int transfer_uart(struct sdp_dev *dev, int report, unsigned char *p, unsigned si
 }
 
 #ifndef WIN32
-int uart_connect(int *uart_fd, char const *tty, int usertscts, struct termios *orig)
+int uart_connect(int *uart_fd, char const *tty, int usertscts, int associate, struct termios *orig)
 #else
-int uart_connect(int *uart_fd, char const *tty, int usertscts, DCB* orig)
+int uart_connect(int *uart_fd, char const *tty, int usertscts, int associate, DCB* orig)
 #endif
 {
 	int err = 0, count = 0;
-	int i;
+	int retry = 10;
 #ifndef WIN32
 	int flags = O_RDWR | O_NOCTTY | O_SYNC;
 	struct termios key;
-	struct serial_struct ser_info; 
 #else
 	int flags = O_RDWR | _O_BINARY;
 	DCB dcb;
@@ -135,10 +114,10 @@ int uart_connect(int *uart_fd, char const *tty, int usertscts, DCB* orig)
 	key.c_cflag |= B115200;
 
 	// Enable blocking read, 0.5s timeout...
-	key.c_cc[VMIN] = 1;
+	key.c_lflag &= ~ICANON; // Set non-canonical mode
 	key.c_cc[VTIME] = 5;
 
-	err = tcsetattr(*uart_fd, TCSAFLUSH, &key);
+	err = tcsetattr(*uart_fd, TCSANOW, &key);
 	if (err < 0) {
 		fprintf(stdout, "tcsetattr() failed: %s\n", strerror(errno));
 		close(*uart_fd);
@@ -196,41 +175,65 @@ int uart_connect(int *uart_fd, char const *tty, int usertscts, DCB* orig)
 
 
 #endif
+	if (!associate)
+		return err;
+
 	// Association phase, send and receive 0x23454523
-	printf("starting associating phase\n");
-	write(*uart_fd, magic, sizeof(magic));
-
+	printf("starting associating phase");
+	while(retry--) {
 #ifndef WIN32
-	err = tcflush(*uart_fd, TCIOFLUSH);
+		// Flush again before retrying
+		err = tcflush(*uart_fd, TCIOFLUSH);
 #endif
-	
-	buf = magic_response;
-	while (count < 4) {
-		err = read(*uart_fd, buf, 4 - count);
 
-		if (err < 0) {
-			fprintf(stderr, "magic timeout, make sure the device "
-			       "is in recovery mode\n");
-			return err;
+		write(*uart_fd, magic, sizeof(magic));
+
+		buf = magic_response;
+
+		count = 0;
+		while (count < 4) {
+			err = read(*uart_fd, buf, 4 - count);
+
+			/* read timeout.. */
+			if (err <= 0)
+				break;
+
+			count += err;
+			buf += err;
 		}
 
-		count += err;
-		buf += err;
+		if (!memcmp(magic, magic_response, sizeof(magic_response)))
+			break;
+
+		printf(".");
+		fflush(stdout);
+#ifndef WIN32
+		err = tcflush(*uart_fd, TCIOFLUSH);
+#endif
+		msleep(1000);
 	}
-	err = 0;
 
-	for (i = 0; i < sizeof(magic); i++) {
-		if (magic[i] != magic_response[i]) {
-			fprintf(stderr, "magic missmatch, response was 0x%08x\n",
-					*(uint32_t *)magic_response);
-			return -1;
-		}
+	printf("\n");
+	fflush(stdout);
+
+	if (!retry) {
+		fprintf(stderr, "associating phase failed, make sure the device"
+		       " is in recovery mode\n");
+		close(*uart_fd);
+		return -2;
+	}
+
+	if (memcmp(magic, magic_response, sizeof(magic_response))) {
+		fprintf(stderr, "magic missmatch, response was 0x%08x\n",
+				*(uint32_t *)magic_response);
+		close(*uart_fd);
+		return -3;
 	}
 
 	fprintf(stderr, "association phase succeeded, response was 0x%08x\n",
 				*(uint32_t *)magic_response);
 
-	return err;
+	return 0;
 }
 
 #ifndef WIN32
@@ -273,6 +276,8 @@ void print_usage(void)
 		"   -v --verify		Verify downloaded data\n"
 		"   -n --no-rtscts	Do not use RTS/CTS flow control\n"
 		"			Default is to use RTS/CTS, Vybrid requires them\n"
+		"   -N --no-association Do not do serial Association Phase\n"
+		"   -d --debugmode      Enable debug logs\n"
 		"\n"
 		"And where [JOBS...] are\n"
 		"   FILE [-lLOADADDR] [-sSIZE] ...\n"
@@ -284,7 +289,7 @@ void print_usage(void)
 
 int parse_opts(int argc, char * const *argv, char const **ttyfile,
 		char const **conffile, int *verify, int *usertscts,
-		struct sdp_work **cmd_head)
+		int *associate, struct sdp_work **cmd_head)
 {
 	char c;
 	*conffile = NULL;
@@ -293,19 +298,27 @@ int parse_opts(int argc, char * const *argv, char const **ttyfile,
 	static struct option long_options[] = {
 		{"help",	no_argument, 	0, 'h' },
 		{"verify",	no_argument, 	0, 'v' },
+		{"debugmode",	no_argument,	0, 'd' },
 		{"no-rtscts",	no_argument, 	0, 'n' },
+		{"no-association", no_argument, 0, 'N' },
 		{0,		0,		0, 0 },
 	};
 
-	while ((c = getopt_long(argc, argv, "+hvn", long_options, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "+hdvnN", long_options, NULL)) != -1) {
 		switch (c)
 		{
 		case 'h':
 		case '?':
 			print_usage();
 			return -1;
+		case 'd':
+			debugmode = 1; /* global extern */
+			break;
 		case 'n':
 			*usertscts = 0;
+			break;
+		case 'N':
+			*associate = 0;
 			break;
 		case 'v':
 			*verify = 1;
@@ -343,10 +356,10 @@ int parse_opts(int argc, char * const *argv, char const **ttyfile,
 int main(int argc, char * const argv[])
 {
 	struct sdp_dev *p_id;
-	int err;
-	int config = 0;
+	int err = 0;
 	int verify = 0;
 	int usertscts = 1;
+	int associate = 1;
 	int uart_fd;
 	struct sdp_work *curr;
 	char const *conf;
@@ -362,7 +375,8 @@ int main(int argc, char * const argv[])
 
 	curr=NULL;
 
-	err = parse_opts(argc, argv, &ttyfile, &conffilepath, &verify, &usertscts, &curr);
+	err = parse_opts(argc, argv, &ttyfile, &conffilepath, &verify,
+				&usertscts, &associate, &curr);
 
 	if (err < 0)
 		return err;
@@ -378,7 +392,7 @@ int main(int argc, char * const argv[])
 		conffile++; // Filename starts after slash
 	}
 
-	conf = conf_file_name(conffile, basepath, "/etc/imx-loader.d/");
+	conf = conf_file_name(conffile, basepath, get_global_conf_path());
 	if (conf == NULL)
 		return -1;
 
@@ -387,10 +401,10 @@ int main(int argc, char * const argv[])
 		return -1;
 
 	// Open UART and start associating phase...
-	err = uart_connect(&uart_fd, ttyfile, usertscts, &orig);
+	err = uart_connect(&uart_fd, ttyfile, usertscts, associate, &orig);
 
 	if (err < 0)
-		goto out;
+		return EXIT_FAILURE;
 
 	p_id->transfer = &transfer_uart;
 
@@ -435,5 +449,5 @@ int main(int argc, char * const argv[])
 
 out:
 	uart_close(&uart_fd, &orig);
-	return 0;
+	return err;
 }
