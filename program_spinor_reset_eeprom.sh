@@ -46,7 +46,7 @@ echo "hid,1024,0x910000,0x80000000,512M" >> $cf
 echo $uboot_mfg_name":dcd" >> $cf
 echo $spl_name":load        0x80100000" >> $cf
 echo $uboot_img_name":load 0x80600000" >> $cf
-echo "eeprom_reset_command.bin:load 0x800FFFE0" >> $cf
+echo "eeprom_reset_command.bin:load 0x800eFFE0" >> $cf
 echo $uboot_mfg_name":clear_dcd, jump header" >> $cf
 
 sudo ./imx_usb
