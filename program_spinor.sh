@@ -42,13 +42,12 @@ cf=mx6_usb_work.conf
 
 rm $cf
 echo mx6_qsb  >> $cf
-echo "hid,1024,0x10000000,1G,0x00907000,0x31000" >> $cf
+echo "hid,1024,0x910000,0x80000000,512M" >> $cf
 echo $uboot_mfg_name":dcd" >> $cf
-echo $spl_name":load        0x12000000" >> $cf
-echo $uboot_img_name":load 0x12500000" >> $cf
+echo $spl_name":load        0x80100000" >> $cf
+echo $uboot_img_name":load 0x80600000" >> $cf
 echo $uboot_mfg_name":clear_dcd, jump header" >> $cf
 
 sudo ./imx_usb
-
 
 
