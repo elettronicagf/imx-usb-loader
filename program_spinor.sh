@@ -15,8 +15,19 @@ fi
 bv=$1
 wid=$2
 uboot_bin_dir=../u-boot/binaries
-spl_name=$uboot_bin_dir/SPL-$bv
-uboot_img_name=$uboot_bin_dir/u-boot.img-$bv
+
+if [ $wid == '0571aa0101' ] || [ $wid == '0571ab0101' ] 
+then
+	cpu_type='mx6ul'
+elif [ $wid == '0571ac0101' ] 
+then
+	cpu_type='mx6ull'
+else
+	echo "Unsupported WID: $wid"
+	exit
+fi
+spl_name=$uboot_bin_dir/SPL-$cpu_type-$bv
+uboot_img_name=$uboot_bin_dir/u-boot.img-$cpu_type-$bv
 uboot_mfg_name=$uboot_bin_dir/u-boot.imx.wid$wid-$bv
 
 if [ ! -e $spl_name ]; then
