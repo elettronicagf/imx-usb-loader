@@ -10,4 +10,5 @@ imx_uart.lds
 .cproject
 .project
 mx6_usb_work.conf
-
+*.imx
+.*.swp
