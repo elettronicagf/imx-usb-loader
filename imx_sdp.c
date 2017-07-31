@@ -787,6 +787,7 @@ static int write_dcd_table_ivt(struct sdp_dev *dev, struct ivt_header *hdr, unsi
 					return -1;
 		}
 	}
+	nanosleep((const struct timespec[]){{0, 1000000000}}, NULL);
 	return err;
 }
 
