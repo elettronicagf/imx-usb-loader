@@ -16,10 +16,10 @@ bv=$1
 wid=$2
 uboot_bin_dir=../u-boot/binaries
 
-if [ $wid == '0571aa0101' ] || [ $wid == '0571ab0101' ] 
+if [ $wid == '0571aa0101' ] || [ $wid == '0571ab0101' ]
 then
 	cpu_type='mx6ul'
-elif [ $wid == '0571ac0101' ] 
+elif [ $wid == '0571ac0101' ]  || [ $wid == '0571ad0101' ] 
 then
 	cpu_type='mx6ull'
 else
