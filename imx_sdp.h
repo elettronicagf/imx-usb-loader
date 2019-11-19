@@ -21,6 +21,8 @@
 #ifndef __IMX_SDP_H__
 #define __IMX_SDP_H__
 
+#include <stdint.h>
+
 struct ram_area {
 	unsigned start;
 	unsigned size;
@@ -44,13 +46,15 @@ struct sdp_work {
 	unsigned char clear_dcd;		//means clear dcd_ptr
 	unsigned char clear_boot_data;		//means clear boot data ptr
 	unsigned char plug;
-#define J_ADDR		1
-#define J_HEADER	2
-#define J_HEADER2	3
+#define J_ADDR_DIRECT	1
+#define J_ADDR_HEADER	2
+#define J_HEADER	3
+#define J_HEADER2	4
 	unsigned char jump_mode;
 	unsigned load_addr;
 	unsigned jump_addr;
 	unsigned load_size;
+	unsigned load_skip;
 };
 
 struct sdp_dev {
@@ -62,6 +66,7 @@ struct sdp_dev {
 #define HDR_NONE	0
 #define HDR_MX51	1
 #define HDR_MX53	2
+#define HDR_UBOOT	3
 	unsigned char header_type;
 	unsigned dcd_addr;
 	struct ram_area ram[8];
@@ -106,19 +111,9 @@ struct sdp_command {
 };
 #pragma pack ()
 
-int get_val(const char** pp, int base);
-const char *move_string(char *dest, const char *src, unsigned cnt);
+void dump_long(unsigned char *src, unsigned cnt, unsigned addr, unsigned skip);
 void dump_bytes(unsigned char *src, unsigned cnt, unsigned addr);
 
-char const *get_global_conf_path(void);
-char const *get_base_path(char const *argv0);
-char const *conf_file_name(char const *file, char const *base_path, char const *conf_path);
-struct sdp_dev *parse_conf(const char *filename);
-struct sdp_work *parse_cmd_args(int argc, char * const *argv);
-
-void perform_mem_work(struct sdp_dev *dev, struct mem_work *mem);
-int do_status(struct sdp_dev *dev);
-
-int DoIRomDownload(struct sdp_dev *dev, struct sdp_work *curr, int verify);
+int do_work(struct sdp_dev *p_id, struct sdp_work **work, int verify);
 
 #endif /* __IMX_SDP_H__ */

@@ -37,10 +37,14 @@
 
 #include "portable.h"
 #include "imx_sdp.h"
+#include "imx_sdp_simulation.h"
+#include "imx_loader.h"
+#include "imx_loader_config.h"
 
 struct mach_id;
 struct mach_id {
-	struct mach_id * next;
+	struct mach_id *next;
+	struct mach_id *nextbatch;
 	unsigned short vid;
 	unsigned short pid;
 	char file_name[256];
@@ -85,24 +89,50 @@ static void print_devs(libusb_device **devs)
 		libusb_free_config_descriptor(config);
 	}
 }
-/*
-	{0x066f, 0x3780, "mx23", 0, 1024, MODE_HID, HDR_NONE},
-	{0x15a2, 0x004f, "mx28", 0, 1024, MODE_HID, HDR_NONE},
-	{0x15a2, 0x0052, "mx50", 0, 1024, MODE_HID, HDR_MX53},
-	{0x15a2, 0x0054, "mx6", 0x10000000, 1024, MODE_HID, HDR_MX53},
-	{0x15a2, 0x0041, "mx51", 0x90000000, 64, MODE_BULK, HDR_MX51},
-	{0x15a2, 0x004e, "mx53", 0x70000000, 512, MODE_BULK, HDR_MX53},
-	{0x066f, 0x37ff, "linux gadget", 512, MODE_BULK, HDR_NONE},
-};
-*/
+
+static struct mach_id *parse_imx_mach(const char **pp)
+{
+	unsigned short vid;
+	unsigned short pid;
+	struct mach_id *curr = NULL;
+	const char *p = *pp;
+
+	while (*p==' ') p++;
+	if (p[0] == '#')
+		return NULL;
+	vid = get_val(&p, 16);
+	if (p[0] != ':') {
+		printf("Syntax error(missing ':'): %s [%s]\n", p, *pp);
+		return NULL;
+	}
+	p++;
+	pid = get_val(&p, 16);
+	if (p[0] != ',') {
+		printf("Syntax error(missing ','): %s [%s]\n", p, *pp);
+		return NULL;
+	}
+	p++;
+	while (*p==' ') p++;
+	if (!(vid && pid)) {
+		printf("vid/pid cannot be 0: %s [%s]\n", p, *pp);
+		return NULL;
+	}
+	curr = (struct mach_id *)malloc(sizeof(struct mach_id));
+	curr->next = NULL;
+	curr->nextbatch = NULL;
+	curr->vid = vid;
+	curr->pid = pid;
+	p = move_string(curr->file_name, p, sizeof(curr->file_name) - 1);
+
+	*pp = p;
+	return curr;
+}
 
 /*
  * Parse USB specific machine configuration
  */
 static struct mach_id *parse_imx_conf(char const *filename)
 {
-	unsigned short vid;
-	unsigned short pid;
 	char line[512];
 	struct mach_id *head = NULL;
 	struct mach_id *tail = NULL;
@@ -117,38 +147,26 @@ static struct mach_id *parse_imx_conf(char const *filename)
 
 	while (fgets(line, sizeof(line), xfile) != NULL) {
 		p = line;
-		while (*p==' ') p++;
-		if (p[0] == '#')
+		curr = parse_imx_mach(&p);
+		if (!curr)
 			continue;
-		vid = get_val(&p, 16);
-		if (p[0] != ':') {
-			printf("Syntax error(missing ':'): %s [%s]\n", p, line);
-			continue;
-		}
-		p++;
-		pid = get_val(&p, 16);
-		if (p[0] != ',') {
-			printf("Syntax error(missing ','): %s [%s]\n", p, line);
-			continue;
-		}
-		p++;
-		while (*p==' ') p++;
-		if (!(vid && pid)) {
-			printf("vid/pid cannot be 0: %s [%s]\n", p, line);
-			continue;
-		}
-		curr = (struct mach_id *)malloc(sizeof(struct mach_id));
-		curr->next = NULL;
-		curr->vid = vid;
-		curr->pid = pid;
-		move_string(curr->file_name, p, sizeof(curr->file_name) - 1);
+
 		if (!head)
 			head = curr;
 		if (tail)
 			tail->next = curr;
 		tail = curr;
 		printf("vid=0x%04x pid=0x%04x file_name=%s\n", curr->vid, curr->pid, curr->file_name);
+
+		while (p[0] == ',') {
+			p++;
+			// Second machine in batch...
+			curr->nextbatch = parse_imx_mach(&p);
+			curr = curr->nextbatch;
+			printf("-> vid=0x%04x pid=0x%04x file_name=%s\n", curr->vid, curr->pid, curr->file_name);
+		}
 	}
+
 	fclose(xfile);
 	return head;
 }
@@ -165,7 +183,7 @@ static struct mach_id * imx_device(unsigned short vid, unsigned short pid, struc
 }
 
 
-static libusb_device *find_imx_dev(libusb_device **devs, struct mach_id **pp_id, struct mach_id *list)
+static libusb_device *find_imx_dev(libusb_device **devs, struct mach_id **pp_id, struct mach_id *list, int bus, int address)
 {
 	int i = 0;
 	struct mach_id *p;
@@ -174,6 +192,9 @@ static libusb_device *find_imx_dev(libusb_device **devs, struct mach_id **pp_id,
 		libusb_device *dev = devs[i++];
 		if (!dev)
 			break;
+		if ((bus >= 0 && libusb_get_bus_number(dev) != bus) ||
+		    (address >= 0 && libusb_get_device_address(dev) != address))
+			continue;
 		int r = libusb_get_device_descriptor(dev, &desc);
 		if (r < 0) {
 			fprintf(stderr, "failed to get device descriptor");
@@ -308,14 +329,43 @@ int transfer_bulk(struct sdp_dev *dev, int report, unsigned char *p, unsigned in
 	return err;
 }
 
-#define ARRAY_SIZE(w) sizeof(w)/sizeof(w[0])
+int transfer_simulation(struct sdp_dev *dev, int report, unsigned char *p, unsigned int cnt,
+		unsigned int expected, int* last_trans)
+{
+	int err = 0;
+	if (cnt > dev->max_transfer)
+		cnt = dev->max_transfer;
 
+	printf("report=%i, cnt=%d\n", report, cnt);
+	switch (report) {
+	case 1:
+	case 2:
+		dump_bytes(p, cnt, 0);
+		break;
+	case 3:
+	case 4:
+		memset(p, 0, cnt);
+		break;
+	}
+
+	err = do_simulation(dev, report, p, cnt, expected, last_trans);
+
+	/* On error, do not transmit anything */
+	if (err)
+		*last_trans = 0;
+	else
+		*last_trans = cnt;
+
+	return err;
+}
+
+#define ARRAY_SIZE(w) sizeof(w)/sizeof(w[0])
 void print_usage(void)
 {
 	printf("Usage: imx_usb [OPTIONS...] [JOBS...]\n"
 		"  e.g. imx_usb -v u-boot.imx\n"
 		"Load data on target connected to USB using serial download protocol. The target\n"
-		"type is detected using USB ID, a appropriate configuration file.\n"
+		"type is detected using USB ID, an appropriate configuration file.\n"
 		"\n"
 		"Where OPTIONS are\n"
 		"   -h --help		Show this help\n"
@@ -323,138 +373,68 @@ void print_usage(void)
 		"   -d --debugmode	Enable debug logs\n"
 		"   -c --configdir=DIR	Reading configuration directory from non standard\n"
 		"			directory.\n"
+		"   -b --bus=NUM		Filter bus number.\n"
+		"   -D --device=NUM	Filter device address.\n"
+		"   -S --sim=VID:PID	Simulate a device of VID:PID\n"
 		"\n"
 		"And where [JOBS...] are\n"
 		"   FILE [-lLOADADDR] [-sSIZE] ...\n"
 		"Multiple jobs can be configured. The first job is treated special, load\n"
 		"address, jump address, and length are read from the IVT header. If no job\n"
-		"is specified, the jobs definied in the target specific configuration file\n"
+		"is specified, the jobs defined in the target specific configuration file\n"
 		"is being used.\n");
 }
 
-int parse_opts(int argc, char * const *argv, char const **configdir,
-		int *verify, struct sdp_work **cmd_head)
+int do_simulation_dev(char const *base_path, char const *conf_path,
+		struct mach_id *list, int verify, struct sdp_work *cmd_head,
+		char const *vidpid)
 {
-	int c;
+	int err;
+	struct mach_id *mach;
+	struct sdp_dev *p_id;
+	struct sdp_work *curr = NULL;
+	char const *conf;
+	unsigned short vid, pid;
 
-	static struct option long_options[] = {
-		{"help",	no_argument, 		0, 'h' },
-		{"debugmode",	no_argument, 		0, 'd' },
-		{"verify",	no_argument, 		0, 'v' },
-		{"configdir",	required_argument, 	0, 'c' },
-		{0,		0,			0, 0 },
-	};
+	sscanf(vidpid, "%hx:%hx", &vid, &pid);
+	printf("Simulating with vid=0x%04hx pid=0x%04hx\n", vid, pid);
 
-	while ((c = getopt_long(argc, argv, "+hdvc:", long_options, NULL)) != -1) {
-		switch (c)
-		{
-		case 'h':
-		case '?':
-			print_usage();
-			return 1;
-		case 'd':
-			debugmode = 1; /* global extern */
-			break;
-		case 'v':
-			*verify = 1;
-			break;
-		case 'c':
-			*configdir = optarg;
-			break;
-		}
+	mach = imx_device(vid, pid, list);
+	if (!mach) {
+		fprintf(stderr, "Could not find device vid=0x%04x pid=0x%04x\n",
+			vid, pid);
+		return -1;
 	}
 
-	if (optind < argc) {
-		// Parse optional job arguments...
-		*cmd_head = parse_cmd_args(argc - optind, &argv[optind]);
-	}
-    else
-    {
-        *cmd_head = NULL;
-    }
+	// Get machine specific configuration file..
+	conf = conf_file_name(mach->file_name, base_path, conf_path);
+	if (conf == NULL)
+		return -1;
 
-	return 0;
-}
+	p_id = parse_conf(conf);
+	if (!p_id)
+		return -1;
 
-int do_work(struct sdp_dev *p_id, struct sdp_work **work, int verify)
-{
-	struct sdp_work *curr = *work;
-	int config = 0;
-	int err = 0;
-	libusb_device_handle *h = p_id->priv;
+	p_id->transfer = &transfer_simulation;
+	curr = p_id->work;
 
-	libusb_get_configuration(h, &config);
-	dbg_printf("bConfigurationValue = 0x%x\n", config);
-
-	if (libusb_kernel_driver_active(h, 0))
-		 libusb_detach_kernel_driver(h, 0);
-
-	err = libusb_claim_interface(h, 0);
-	if (err) {
-		fprintf(stderr, "claim interface failed\n");
-		return err;
-	}
-	printf("Interface 0 claimed\n");
-	err = do_status(p_id);
-	if (err) {
-		fprintf(stderr, "status failed\n");
-		goto err_release_interface;
+	// Prefer work from command line, disable batch mode...
+	if (cmd_head) {
+		curr = cmd_head;
+		mach->nextbatch = NULL;
 	}
 
-	while (curr) {
-		/* Do current job */
-		if (curr->mem)
-			perform_mem_work(p_id, curr->mem);
-		if (curr->filename[0])
-			err = DoIRomDownload(p_id, curr, verify);
-		if (err) {
-			fprintf(stderr, "DoIRomDownload failed, err=%d\n", err);
-			do_status(p_id);
-			break;
-		}
+	err = do_work(p_id, &curr, verify);
+	dbg_printf("do_work finished with err=%d, curr=%p\n", err, curr);
 
-		/* Check if more work is to do... */
-		if (!curr->next) {
-			/*
-			 * If only one job, but with a plug-in is specified
-			 * reexecute the same job, but this time download the
-			 * image. This allows to specify a single file with
-			 * plugin and image, and imx_usb will download & run
-			 * the plugin first and then the image.
-			 * NOTE: If the file does not contain a plugin,
-			 * DoIRomDownload->process_header will set curr->plug
-			 * to 0, so we won't download the same image twice...
-			 */
-			if (curr->plug) {
-				curr->plug = 0;
-			} else {
-				curr = NULL;
-				break;
-			}
-		} else {
-			curr = curr->next;
-		}
+	do_simulation_cleanup();
 
-		/*
-		 * Check if device is still here, otherwise return
-		 * with work (retry)
-		 */
-		err = do_status(p_id);
-		if (err < 0) {
-			err = 0;
-			break;
-		}
-	}
-
-	*work = curr;
-
-err_release_interface:
-	libusb_release_interface(h, 0);
 	return err;
 }
 
 int do_autodetect_dev(char const *base_path, char const *conf_path,
-		struct mach_id *list, int verify, struct sdp_work *cmd_head)
+		struct mach_id *list, int verify, struct sdp_work *cmd_head,
+		int bus, int address)
 {
 	struct sdp_dev *p_id;
 	struct mach_id *mach;
@@ -462,10 +442,11 @@ int do_autodetect_dev(char const *base_path, char const *conf_path,
 	libusb_device *dev;
 	int err = 0;
 	ssize_t cnt;
-	struct sdp_work *curr;
+	struct sdp_work *curr = NULL;
 	libusb_device_handle *h = NULL;
 	char const *conf;
 	int retry;
+	int config = 0;
 
 	err = libusb_init(NULL);
 	if (err < 0)
@@ -479,73 +460,97 @@ int do_autodetect_dev(char const *base_path, char const *conf_path,
 
 	if (debugmode)
 		print_devs(devs);
-	dev = find_imx_dev(devs, &mach, list);
+	dev = find_imx_dev(devs, &mach, list, bus, address);
 	if (!dev) {
-		libusb_free_device_list(devs, 1);
 		err = LIBUSB_ERROR_NO_DEVICE;
 		goto out_deinit_usb;
 	}
 
-	err = libusb_open(dev, &h);
-	libusb_free_device_list(devs, 1);
-	if (err < 0) {
-		fprintf(stderr, "Could not open device vid=0x%x pid=0x%x: %s, err=%d\n",
-			mach->vid, mach->pid, libusb_strerror(err), err);
-		goto out_deinit_usb;
-	}
-
-	// Get machine specific configuration file..
-	conf = conf_file_name(mach->file_name, base_path, conf_path);
-	if (conf == NULL) {
-		err = LIBUSB_ERROR_OTHER;
-		goto out_close_usb;
-	}
-
-	p_id = parse_conf(conf);
-	if (!p_id) {
-		err = LIBUSB_ERROR_OTHER;
-		goto out_close_usb;
-	}
-
-	if (p_id->mode == MODE_HID)
-		p_id->transfer = &transfer_hid;
-	if (p_id->mode == MODE_BULK)
-		p_id->transfer = &transfer_bulk;
-
-	// By default, use work from config file...
-	curr = p_id->work;
-
-	if (cmd_head != NULL)
-		curr = cmd_head;
-
-	if (curr == NULL) {
-		fprintf(stderr, "no job found\n");
-		err = LIBUSB_ERROR_OTHER;
-		goto out_close_usb;
-	}
-
-retry:
-	// USB private pointer is libusb device handle...
-	p_id->priv = h;
-
-	err = do_work(p_id, &curr, verify);
-	dbg_printf("do_work finished with err=%d, curr=%p\n", err, curr);
-
-out_close_usb:
-	libusb_close(h);
-
-	/* More work to do? Try to rediscover the same device */
-	if (curr && !(err < 0)) {
-		for (retry = 0; retry < 10; retry++) {
-			msleep(3000);
-			h = libusb_open_device_with_vid_pid(NULL, mach->vid, mach->pid);
-			if (h)
-				goto retry;
-
-			fprintf(stderr, "Could not open device vid=0x%x pid=0x%x err=%d\n",
-					mach->vid, mach->pid, err);
+	while (mach) {
+		// Get machine specific configuration file..
+		conf = conf_file_name(mach->file_name, base_path, conf_path);
+		if (conf == NULL) {
+			err = LIBUSB_ERROR_OTHER;
+			break;
 		}
+
+		p_id = parse_conf(conf);
+		if (!p_id) {
+			err = LIBUSB_ERROR_OTHER;
+			break;
+		}
+
+		if (p_id->mode == MODE_HID)
+			p_id->transfer = &transfer_hid;
+		if (p_id->mode == MODE_BULK)
+			p_id->transfer = &transfer_bulk;
+
+		curr = p_id->work;
+
+		// Prefer work from command line, disable batch mode...
+		if (cmd_head) {
+			curr = cmd_head;
+			mach->nextbatch = NULL;
+		}
+
+		if (curr == NULL) {
+			fprintf(stderr, "no job found\n");
+			err = LIBUSB_ERROR_OTHER;
+			break;
+		}
+
+		// Wait for device...
+		printf("Trying to open device vid=0x%04x pid=0x%04x", mach->vid, mach->pid);
+		fflush(stdout);
+		for (retry = 0; retry < 50; retry++) {
+			h = NULL;
+			err = libusb_open(dev, &h);
+			if (h)
+				break;
+
+			msleep(500);
+			if (retry % 2)
+				printf(".");
+			fflush(stdout);
+		}
+		printf("\n");
+		if (!h) {
+			err = LIBUSB_ERROR_NO_DEVICE;
+			fprintf(stderr, "Could not open device vid=0x%04x pid=0x%04x\n",
+				mach->vid, mach->pid);
+			break;
+		}
+
+		// USB private pointer is libusb device handle...
+		p_id->priv = h;
+
+		libusb_get_configuration(h, &config);
+		dbg_printf("bConfigurationValue = 0x%x\n", config);
+
+		if (libusb_kernel_driver_active(h, 0))
+			 libusb_detach_kernel_driver(h, 0);
+
+		err = libusb_claim_interface(h, 0);
+		if (err) {
+			fprintf(stderr, "claim interface failed\n");
+			break;
+		}
+		printf("Interface 0 claimed\n");
+
+		err = do_work(p_id, &curr, verify);
+		dbg_printf("do_work finished with err=%d, curr=%p\n", err, curr);
+
+		libusb_release_interface(h, 0);
+		libusb_close(h);
+
+		if (err)
+			break;
+
+		// We might have to retry the same machine in case of plugin...
+		if (!curr)
+			mach = mach->nextbatch;
 	}
+	libusb_free_device_list(devs, 1);
 
 out_deinit_usb:
 	libusb_exit(NULL);
@@ -553,20 +558,65 @@ out_deinit_usb:
 	return err;
 }
 
+static const struct option long_options[] = {
+	{"help",	no_argument, 		0, 'h' },
+	{"debugmode",	no_argument, 		0, 'd' },
+	{"verify",	no_argument, 		0, 'v' },
+	{"version",	no_argument, 		0, 'V' },
+	{"configdir",	required_argument, 	0, 'c' },
+	{"bus",		required_argument,	0, 'b' },
+	{"device",	required_argument, 	0, 'D' },
+	{"sim",		required_argument, 	0, 'S' },
+	{0,		0,			0, 0 },
+};
+
 int main(int argc, char * const argv[])
 {
-	int err;
+	int err, c;
 	int verify = 0;
 	struct sdp_work *cmd_head = NULL;
 	char const *conf;
 	char const *base_path = get_base_path(argv[0]);
 	char const *conf_path = get_global_conf_path();
+	char const *sim_vidpid = NULL;
+	int bus = -1;
+	int address = -1;
 
-	err = parse_opts(argc, argv, &conf_path, &verify, &cmd_head);
-	if (err < 0)
-		return EXIT_FAILURE;
-	else if (err > 0)
-		return EXIT_SUCCESS;
+	while ((c = getopt_long(argc, argv, "+hdvVc:b:D:S:", long_options, NULL)) != -1) {
+		switch (c)
+		{
+		case 'h':
+		case '?':
+			print_usage();
+			return EXIT_SUCCESS;
+		case 'd':
+			debugmode = 1; /* global extern */
+			break;
+		case 'v':
+			verify = 1;
+			break;
+		case 'V':
+			printf("imx_usb " IMX_LOADER_VERSION "\n");
+			return EXIT_SUCCESS;
+		case 'c':
+			conf_path = optarg;
+			break;
+		case 'b':
+			bus = atoi(optarg);
+			break;
+		case 'D':
+			address = atoi(optarg);
+			break;
+		case 'S':
+			sim_vidpid = optarg;
+			break;
+		}
+	}
+
+	if (optind < argc) {
+		// Parse optional job arguments...
+		cmd_head = parse_cmd_args(argc - optind, &argv[optind]);
+	}
 
 	// Get list of machines...
 	conf = conf_file_name("imx_usb.conf", base_path, conf_path);
@@ -577,7 +627,12 @@ int main(int argc, char * const argv[])
 	if (!list)
 		return EXIT_FAILURE;
 
-	err = do_autodetect_dev(base_path, conf_path, list, verify, cmd_head);
+	if (sim_vidpid)
+		err = do_simulation_dev(base_path, conf_path, list, verify,
+					cmd_head, sim_vidpid);
+	else
+		err = do_autodetect_dev(base_path, conf_path, list, verify,
+					cmd_head, bus, address);
 	if (err < 0)
 		return EXIT_FAILURE;
 

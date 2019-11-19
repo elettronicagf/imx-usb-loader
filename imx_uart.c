@@ -39,6 +39,8 @@
 
 #include "portable.h"
 #include "imx_sdp.h"
+#include "imx_loader.h"
+#include "imx_loader_config.h"
 
 extern int debugmode;
 
@@ -283,7 +285,7 @@ void print_usage(void)
 		"   FILE [-lLOADADDR] [-sSIZE] ...\n"
 		"Multiple jobs can be configured. The first job is treated special, load\n"
 		"address, jump address, and length are read from the IVT header. If no job\n"
-		"is specified, the jobs definied in the target specific configuration file\n"
+		"is specified, the jobs defined in the target specific configuration file\n"
 		"is being used.\n");
 }
 
@@ -298,19 +300,20 @@ int parse_opts(int argc, char * const *argv, char const **ttyfile,
 	static struct option long_options[] = {
 		{"help",	no_argument, 	0, 'h' },
 		{"verify",	no_argument, 	0, 'v' },
+		{"version",	no_argument, 	0, 'V' },
 		{"debugmode",	no_argument,	0, 'd' },
 		{"no-rtscts",	no_argument, 	0, 'n' },
 		{"no-association", no_argument, 0, 'N' },
 		{0,		0,		0, 0 },
 	};
 
-	while ((c = getopt_long(argc, argv, "+hdvnN", long_options, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "+hdvVnN", long_options, NULL)) != -1) {
 		switch (c)
 		{
 		case 'h':
 		case '?':
 			print_usage();
-			return -1;
+			return 1;
 		case 'd':
 			debugmode = 1; /* global extern */
 			break;
@@ -323,6 +326,9 @@ int parse_opts(int argc, char * const *argv, char const **ttyfile,
 		case 'v':
 			*verify = 1;
 			break;
+		case 'V':
+			printf("imx_usb " IMX_LOADER_VERSION "\n");
+			return 1;
 		}
 	}
 
@@ -379,7 +385,9 @@ int main(int argc, char * const argv[])
 				&usertscts, &associate, &curr);
 
 	if (err < 0)
-		return err;
+		return EXIT_FAILURE;
+	else if (err > 0)
+		return EXIT_SUCCESS;
 
 	// Get machine specific configuration file..
 	if ((conffile = strrchr(conffilepath, PATH_SEPARATOR)) == NULL) {
@@ -411,43 +419,13 @@ int main(int argc, char * const argv[])
 	// UART private pointer is TTY file descriptor...
 	p_id->priv = &uart_fd;
 
-	err = do_status(p_id);
-	if (err) {
-		printf("status failed\n");
-		goto out;
-	}
-
 	// By default, use work from config file...
 	if (curr == NULL)
 		curr = p_id->work;
 
-	while (curr) {
-		if (curr->mem)
-			perform_mem_work(p_id, curr->mem);
-//		printf("jump_mode %x\n", curr->jump_mode);
-		if (curr->filename[0]) {
-			err = DoIRomDownload(p_id, curr, verify);
-		}
-		if (err) {
-			err = do_status(p_id);
-			break;
-		}
-		if (!curr->next && !curr->plug)
-			break;
-		err = do_status(p_id);
-		printf("jump_mode %x plug=%i err=%i\n", curr->jump_mode, curr->plug, err);
+	err = do_work(p_id, &curr, verify);
+	dbg_printf("do_work finished with err=%d, curr=%p\n", err, curr);
 
-		if (err)
-			goto out;
-
-		if (curr->plug) {
-			curr->plug = 0;
-			continue;
-		}
-		curr = curr->next;
-	}
-
-out:
 	uart_close(&uart_fd, &orig);
 	return err;
 }

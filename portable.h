@@ -5,11 +5,14 @@ extern int debugmode;
 
 #ifndef WIN32
 #define dbg_printf(fmt, args...)	do{ if(debugmode) fprintf(stderr, fmt, ## args); } while(0)
+#define dbg_dump_long(src, cnt, addr, skip) do{ if(debugmode) dump_long(src, cnt, addr, skip); } while(0)
 #else
 
 #ifdef DEBUG
 #define dbg_printf(fmt, ...)	fprintf(stderr, fmt, __VA_ARGS__)
+#define dbg_dump_long(src, cnt, addr, skip) dump_long(src, cnt, addr, skip)
 #else
+#define dbg_dump_long(src, cnt, addr, skip)
 #define dbg_printf(fmt, ...)    /* Don't do anything in release builds */
 #endif
 #endif
@@ -50,6 +53,27 @@ extern int debugmode;
 #define close(fd)				_close(fd)
 #define access(filename,oflag)	_access(filename,oflag)
 #define getcwd(buffer, maxlen)	_getcwd(buffer, maxlen)
+#endif
+
+#ifdef __GNUC__
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define BE32(x) __builtin_bswap32(x)
+#if (__GNUC__ > 4) || ((__GNUC__ == 4) && (__GNUC_MINOR__ >= 8))
+#define BE16(x) __builtin_bswap16(x)
+#else
+#define BE16(x) \
+({ \
+	typeof(x) __x = (x); \
+	(((__x << 8) & 0xffff) | ((__x >> 8) & 0xff)); \
+})
+#endif
+#else
+#define BE32(x) x
+#define BE16(x) x
+#endif
+#elif _MSC_VER // assume little endian...
+#define BE32(x) _byteswap_ulong(x)
+#define BE16(x) _byteswap_ushort(x)
 #endif
 
 #endif /* __PORTABLE_H__ */

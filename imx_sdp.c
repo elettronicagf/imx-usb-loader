@@ -26,477 +26,112 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 #include "portable.h"
 #include "imx_sdp.h"
+#include "image.h"
+
+#define FT_APP	0xaa
+#define FT_CSF	0xcc
+#define FT_DCD	0xee
+#define FT_LOAD_ONLY	0x00
+
 int debugmode = 0;
 
-#ifdef __GNUC__
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-#define BE32(x) __builtin_bswap32(x)
-#else
-#define BE32(x) x
-#endif
-#elif _MSC_VER // assume little endian...
-#define BE32(x) _byteswap_ulong(x)
-#endif
-
 #define get_min(a, b) (((a) < (b)) ? (a) : (b))
+#define ARRAY_SIZE(x)	(sizeof(x) / sizeof(x[0]))
 
-int get_val(const char** pp, int base)
-{
-	int val = 0;
-	const char *p = *pp;
-	while (*p==' ') p++;
-	if (*p=='0') {
-		p++;
-		if ((*p=='x')||(*p=='X')) {
-			p++;
-			base = 16;
-		}
-	}
-	while (*p) {
-		char c = *p++;
-		if ((c >= '0')&&(c <= '9')) {
-			c -= '0';
-		} else {
-			c &= ~('a'-'A');
-			if ((c >= 'A')&&(c <= 'F')) c -= ('A'-10);
-			else {
-				p--;
-				break;
-			}
-		}
-		if (c >= base) {
-			printf("Syntax error: %s\n", p-1);
-			val = -1;
-			break;
-		}
-		val = (val * base) + c;
-	}
-	while (*p==' ') p++;
-	*pp = p;
-	return val;
-}
-
-const char *move_string(char *dest, const char *src, unsigned cnt)
-{
-	unsigned i = 0;
-	while (i < cnt) {
-		char c = *src++;
-		if ((!c) || (c == ' ') || (c == 0x0d) || (c == '\n') || (c == '#') || (c == ':')) {
-			src--;
-			break;
-		}
-		dest[i++] = c;
-	}
-	dest[i] = '\0';
-	return src;
-}
-
-char const *get_base_path(char const *argv0)
-{
-	static char base_path[PATH_MAX];
-	char *e;
-
-	strncpy(base_path, argv0, sizeof(base_path));
-	e = strrchr(base_path, PATH_SEPARATOR);
-#ifdef  __unix__
-	if (!e) {
-		readlink("/proc/self/exe", base_path,sizeof(base_path));
-		e = strrchr(base_path, PATH_SEPARATOR);
-	}
+#ifndef offsetof
+#define offsetof(TYPE, MEMBER) __builtin_offsetof(TYPE, MEMBER)
+//#define offsetof(TYPE, MEMBER) ((size_t) &((TYPE *)0)->MEMBER)
 #endif
-	if (e) {
-		dbg_printf( "trailing slash == %p:%s\n", e, e);
-		e[1] = 0;
-	} else {
-		dbg_printf( "no trailing slash\n");
-	}
 
-	return base_path;
-}
+struct load_desc {
+	struct sdp_work *curr;
+	FILE* xfile;
+	unsigned fsize;
+	int verify;
+	unsigned char *buf_start;
+	unsigned buf_size;
+	unsigned buf_cnt;
+	unsigned buf_offset;
+	unsigned dladdr;
+	unsigned max_length;
+	unsigned plugin;
+	unsigned header_addr;
+	unsigned header_offset;
+	unsigned char writeable_header[1024];
+};
 
-char const *get_global_conf_path()
-{
-#ifdef WIN32
-	static char conf[PATH_MAX];
-	static char sep = PATH_SEPARATOR;
-	const char *subdir = "imx_loader";
-	char const *progdata = getenv("ProgramData");
+/* Boot data image indicator */
+#define PLUGIN_IMAGE_FLAG_MASK              (0x0001)    /* bit 0 is plugin */
+#define HDMI_IMAGE_FLAG_MASK                (0x0002)    /* bit 1 is HDMI */
 
-	strncpy(conf, progdata, sizeof(conf));
-	strncat(conf, &sep, sizeof(conf));
-	strncat(conf, subdir, sizeof(conf));
-	return conf;
-#else
-	char const *global_conf_path = SYSCONFDIR "/imx-loader.d/";
-	return global_conf_path;
-#endif
-}
+struct boot_data {
+	uint32_t dest;
+	uint32_t image_len;
+	uint32_t plugin;
+};
 
-char const *conf_path_ok(char const *conf_path, char const *conf_file)
-{
-	static char conf[PATH_MAX];
-	static char sep = PATH_SEPARATOR;
+/* Command tags and parameters */
+#define IVT_HEADER_TAG			0xD1
+#define IVT_VERSION			0x40
+#define IVT_VERSION_IMX8M		0x41
+#define DCD_HEADER_TAG			0xD2
+#define DCD_VERSION			0x40
+#define DCD_VERSION_IMX8M		0x41
 
-	strncpy(conf, conf_path, sizeof(conf));
-	strncat(conf, &sep, sizeof(conf) - strlen(conf) - 1);
-	strncat(conf, conf_file, sizeof(conf) - strlen(conf) - 1);
-	if (access(conf, R_OK) != -1) {
-		printf("config file <%s>\n", conf);
-		return conf;
-	}
-	return NULL;
-}
+#pragma pack (1)
+struct ivt_header {
+        uint8_t tag;
+        uint16_t length;
+        uint8_t version;
+};
+#pragma pack ()
 
-char const *conf_file_name(char const *file, char const *base_path, char const *conf_path)
-{
-	char const *conf;
-	char cwd[PATH_MAX];
+struct flash_header_v2 {
+	struct ivt_header header;
+	uint32_t start_addr;
+	uint32_t reserv1;
+	uint32_t dcd_ptr;
+	uint32_t boot_data_ptr;		/* struct boot_data * */
+	uint32_t self_ptr;		/* struct flash_header_v2 *, this - boot_data.start = offset linked at */
+	uint32_t app_code_csf;
+	uint32_t reserv2;
+};
 
-	// First priority, conf path... (either -c, binary or /etc/imx-loader.d/)
-	dbg_printf("checking with conf_path %s\n", conf_path);
-	conf = conf_path_ok(conf_path, file);
-	if (conf != NULL)
-		return conf;
+#pragma pack (1)
+struct write_dcd_command {
+	uint8_t tag;
+	uint16_t length;
+	uint8_t param;
+};
+#pragma pack ()
 
-	// Second priority, base path, relative path of binary...
-	dbg_printf("checking with base_path %s\n", base_path);
-	conf = conf_path_ok(base_path, file);
-	if (conf != NULL)
-		return conf;
+struct dcd_v2 {
+	struct ivt_header header;
+	struct write_dcd_command write_dcd_command;
+	unsigned char *addr_data;
+};
 
-	// Third priority, working directory...
-	getcwd(cwd, PATH_MAX);
-	dbg_printf("checking with cwd %s\n", cwd);
-	conf = conf_path_ok(cwd, file);
-	if (conf != NULL)
-		return conf;
-
-	printf("%s not found\n", file);
-	return NULL;
-}
-
-char const *skip(const char *p, char c)
-{
-	while (*p==' ') p++;
-	if (*p == c) {
-		p++;
-	}
-	while (*p==' ') p++;
-	return p;
-}
-
-int end_of_line(const char *p)
-{
-	while (*p == ' ') p++;
-	if ((!p[0]) || (*p == '#') || (*p == '\n') || (*p == '\r'))
-		return 1;
-	return 0;
-}
-
-
-void parse_mem_work(struct sdp_work *curr, const char *filename, const char *p)
-{
-	struct mem_work *wp;
-	struct mem_work **link;
-	struct mem_work w;
-	unsigned int i;
-	const char *start = p;
-
-	p = skip(p,':');
-	memset(&w, 0, sizeof(w));
-	if (strncmp(p, "read", 4) == 0) {
-		p += 4;
-		p = skip(p,',');
-		i = MEM_TYPE_READ;
-	} else if (strncmp(p, "write", 5) == 0) {
-		p += 5;
-		p = skip(p,',');
-		i = MEM_TYPE_WRITE;
-	} else if (strncmp(p, "modify", 6) == 0) {
-		p += 6;
-		p = skip(p,',');
-		i = MEM_TYPE_MODIFY;
-	} else {
-		printf("%s: syntax error: %s {%s}\n", filename, p, start);
-	}
-	w.type = i;
-	i = 0;
-	for (;;) {
-		w.vals[i] = get_val(&p, 16);
-		if (i >= w.type)
-			break;
-		p = skip(p,',');
-		if ((*p == 0) || (*p == '#')) {
-			printf("%s: missing argment: %s {%s}\n", filename, p, start);
-			return;
-		}
-		i++;
-	}
-	if (!end_of_line(p)) {
-		printf("%s: syntax error: %s {%s}\n", filename, p, start);
-		return;
-	}
-	wp = (struct mem_work *)malloc(sizeof(struct mem_work));
-	if (!wp)
-		return;
-	link = &curr->mem;
-	while (*link)
-		link = &(*link)->next;
-	*wp = w;
-	*link = wp;
-}
-
-void parse_file_work(struct sdp_work *curr, const char *filename, const char *p)
-{
-	const char *start = p;
-
-	p = move_string(curr->filename, p, sizeof(curr->filename) - 1);
-	p = skip(p,':');
-	for (;;) {
-		const char *q = p;
-		if ((!*p) || (*p == '#')  || (*p == '\n') || (*p == 0x0d))
-			break;
-		if (strncmp(p, "dcd", 3) == 0) {
-			p += 3;
-			p = skip(p,',');
-			curr->dcd = 1;
-		}
-		if (strncmp(p, "clear_dcd", 9) == 0) {
-			p += 9;
-			p = skip(p,',');
-			curr->clear_dcd = 1;
-//			printf("clear_dcd\n");
-		}
-		if (strncmp(p, "clear_boot_data", 15) == 0) {
-			p += 15;
-			p = skip(p,',');
-			curr->clear_boot_data = 1;
-//			printf("clear_dcd\n");
-		}
-		if (strncmp(p, "plug", 4) == 0) {
-			p += 4;
-			p = skip(p,',');
-			curr->plug = 1;
-//			printf("plug\n");
-		}
-		if (strncmp(p, "load", 4) == 0) {
-			p += 4;
-			curr->load_addr = get_val(&p, 16);
-			p = skip(p,',');
-		}
-		if (strncmp(p, "jump", 4) == 0) {
-			p += 4;
-			curr->jump_mode = J_ADDR;
-			curr->jump_addr = get_val(&p, 16);
-			if (strncmp(p, "header2", 7) == 0) {
-				p += 7;
-				p = skip(p,',');
-				curr->jump_mode = J_HEADER2;
-			} else if (strncmp(p, "header", 6) == 0) {
-				p += 6;
-				p = skip(p,',');
-				curr->jump_mode = J_HEADER;
-			}
-			p = skip(p,',');
-//			printf("jump\n");
-		}
-		if (q == p) {
-			printf("%s: syntax error: %s {%s}\n", filename, p, start);
-			break;
-		}
-	}
-}
 
 /*
- * #hid/bulk,[old_header,]max packet size, {ram start, ram size}(repeat valid ram areas)
- *hid,1024,0x10000000,1G,0x00907000,0x31000
- *
+ * MX51 header type
  */
-void parse_transfer_type(struct sdp_dev *usb, const char *filename, const char *p)
-{
-	int i;
+struct flash_header_v1 {
+	uint32_t app_start_addr;
+#define APP_BARKER	0xb1
+#define DCD_BARKER	0xb17219e9
+	uint32_t app_barker;
+	uint32_t csf_ptr;
+	uint32_t dcd_ptr_ptr;
+	uint32_t srk_ptr;
+	uint32_t dcd_ptr;
+	uint32_t app_dest_ptr;
+};
 
-	if (strncmp(p, "hid", 3) == 0) {
-		p += 3;
-		p = skip(p,',');
-		usb->mode = MODE_HID;
-	} else if (strncmp(p, "bulk", 4) == 0) {
-		p += 4;
-		p = skip(p,',');
-		usb->mode = MODE_BULK;
-	} else {
-		printf("%s: hid/bulk expected\n", filename);
-	}
-	if (strncmp(p, "old_header", 10) == 0) {
-		p += 10;
-		p = skip(p,',');
-		usb->header_type = HDR_MX51;
-	} else {
-		usb->header_type = HDR_MX53;
-	}
-	usb->max_transfer = get_val(&p, 10);
-	p = skip(p,',');
-	usb->dcd_addr = get_val(&p, 16);
-	p = skip(p,',');
-	for (i = 0; i < 8; i++) {
-		usb->ram[i].start = get_val(&p, 10);
-		p = skip(p,',');
-		usb->ram[i].size = get_val(&p, 10);
-		if ((*p == 'G') || (*p == 'g')) {
-			usb->ram[i].size <<= 30;
-			p++;
-		} else if ((*p == 'M') || (*p == 'm')) {
-			usb->ram[i].size <<= 20;
-			p++;
-		} else if ((*p == 'K') || (*p == 'k')) {
-			usb->ram[i].size <<= 10;
-			p++;
-		}
-		p = skip(p,',');
-		if ((*p == '#') || (*p == '\n') || (!*p))
-			break;
-	}
-}
-
-struct sdp_dev *parse_conf(const char *filename)
-{
-	char line[512];
-	FILE *xfile;
-	const char *p;
-	struct sdp_work *tail = NULL;
-	struct sdp_work *curr = NULL;
-	struct sdp_dev *usb = (struct sdp_dev *)malloc(sizeof(struct sdp_dev));
-	if (!usb)
-		return NULL;
-	memset(usb, 0, sizeof(struct sdp_dev));
-
-	xfile = fopen(filename, "rb" );
-	if (!xfile) {
-		printf("Could not open file: {%s}\n", filename);
-		free(usb);
-		return NULL;
-	}
-	printf("parse %s\n", filename);
-
-	while (fgets(line, sizeof(line), xfile) != NULL) {
-		p = line;
-		while (*p==' ') p++;
-		if (p[0] == '#')
-			continue;
-		if (p[0] == 0)
-			continue;
-		if (p[0] == '\n')
-			continue;
-		if (p[0] == 0x0d)
-			continue;
-		if (!usb->name[0]) {
-			p = move_string(usb->name, p, sizeof(usb->name) - 1);
-			continue;
-		}
-		if (!usb->max_transfer) {
-			parse_transfer_type(usb, filename, p);
-			continue;
-		}
-		/*
-		 * #file:dcd,plug,load nnn,jump [nnn/header/header2]
-		 */
-		if (!curr) {
-			curr = (struct sdp_work *)malloc(sizeof(struct sdp_work));
-			if (!curr)
-				break;
-			memset(curr, 0, sizeof(struct sdp_work));
-			if (!usb->work)
-				usb->work = curr;
-			if (tail)
-				tail->next = curr;
-			tail = curr;
-			curr->load_addr = usb->ram[0].start + 0x03f00000;	/* default */
-		}
-
-		if (p[0] == ':') {
-			parse_mem_work(curr, filename, p);
-		} else {
-			parse_file_work(curr, filename, p);
-			curr = NULL;
-		}
-	}
-	return usb;
-}
-
-struct sdp_work *parse_cmd_args(int argc, char * const *argv)
-{
-	int i = 0;
-	struct sdp_work *prev = NULL;
-	struct sdp_work *w = NULL;
-	struct sdp_work *head = NULL;
-
-	while (argc > i) {
-		const char *p = argv[i];
-		if (*p == '-') {
-			char c;
-			p++;
-			c = *p++;
-			if (w == NULL) {
-				printf("specify file first\n");
-				exit(1);
-			}
-			if (!*p) {
-				i++;
-				p = argv[i];
-			}
-			if (c == 's') {
-				w->load_size = get_val(&p, 10);
-				if (!w->load_addr)
-					w->load_addr = 0x10800000;
-				w->plug = 0;
-				w->jump_mode = 0;
-				i++;
-				continue;
-			}
-			if (c == 'l') {
-				w->load_addr = get_val(&p, 16);
-				w->plug = 0;
-				w->jump_mode = 0;
-				i++;
-				continue;
-			}
-			fprintf(stderr, "Unknown option %s\n", p);
-			exit(1);
-		}
-
-		// Initialize work structure..
-		w = malloc(sizeof(struct sdp_work));
-		memset(w, 0, sizeof(struct sdp_work));
-		strncpy(w->filename, argv[i], sizeof(w->filename) - 1);
-		if (access(w->filename, R_OK) == -1) {
-			fprintf(stderr, "cannot read from file %s\n",
-					w->filename);
-			exit(1);
-		}
-
-
-		if (head == NULL) {
-			// Special settings for first work...
-			w->dcd = 1;
-			w->plug = 1;
-			w->jump_mode = J_HEADER;
-			head = w;
-		}
-
-		if (prev != NULL)
-			prev->next = w;
-		prev = w;
-
-		i++;
-	}
-
-	return head;
-}
-
-void print_sdp_work(struct sdp_work *curr)
+static void print_sdp_work(struct sdp_work *curr)
 {
 	printf("== work item\n");
 	printf("filename %s\n", curr->filename);
@@ -511,7 +146,7 @@ void print_sdp_work(struct sdp_work *curr)
 	return;
 }
 
-long get_file_size(FILE *xfile)
+static long get_file_size(FILE *xfile)
 {
 	long size;
 	fseek(xfile, 0, SEEK_END);
@@ -521,38 +156,48 @@ long get_file_size(FILE *xfile)
 	return size;
 }
 
-struct boot_data {
-	uint32_t dest;
-	uint32_t image_len;
-	uint32_t plugin;
-};
+static int do_response(struct sdp_dev *dev, int report, unsigned int *result,
+		bool silent)
+{
+	unsigned char tmp[64] =  { 0 };
+	int last_trans, err;
 
-struct ivt_header {
-#define IVT_BARKER 0x402000d1
-	uint32_t barker;
-	uint32_t start_addr;
-	uint32_t reserv1;
-	uint32_t dcd_ptr;
-	uint32_t boot_data_ptr;		/* struct boot_data * */
-	uint32_t self_ptr;		/* struct ivt_header *, this - boot_data.start = offset linked at */
-	uint32_t app_code_csf;
-	uint32_t reserv2;
-};
+	err = dev->transfer(dev, report, tmp, sizeof(tmp), 4, &last_trans);
+	if ((!silent && err) || debugmode)
+		printf("report %d in err=%i, last_trans=%i  %02x %02x %02x %02x\n",
+			report, err, last_trans, tmp[0], tmp[1], tmp[2], tmp[3]);
 
-/*
- * MX51 header type
- */
-struct old_app_header {
-	uint32_t app_start_addr;
-#define APP_BARKER	0xb1
-#define DCD_BARKER	0xb17219e9
-	uint32_t app_barker;
-	uint32_t csf_ptr;
-	uint32_t dcd_ptr_ptr;
-	uint32_t srk_ptr;
-	uint32_t dcd_ptr;
-	uint32_t app_dest_ptr;
-};
+	/* At least 4 bytes required for a valid result */
+	if (last_trans < 4)
+		return -1;
+
+	/*
+	 * Most results are symetric, but likely are meant to be big endian
+	 * as everything else is...
+	 */
+	*result = BE32(*((unsigned int*)tmp));
+
+	return err;
+}
+
+static int do_command(struct sdp_dev *dev, struct sdp_command *cmd, int retry)
+{
+	int last_trans, err = -4;
+
+	dbg_printf("sending command cmd=%04x\n", cmd->cmd);
+	while (retry) {
+		err = dev->transfer(dev, 1, (unsigned char *)cmd,
+				    sizeof(*cmd), 0, &last_trans);
+		if (err || debugmode)
+			printf("%s err=%i, last_trans=%i\n", __func__, err, last_trans);
+		if (!err)
+			return 0;
+
+		retry--;
+	}
+
+	return err;
+}
 
 static int read_memory(struct sdp_dev *dev, unsigned addr, unsigned char *dest, unsigned cnt)
 {
@@ -568,22 +213,17 @@ static int read_memory(struct sdp_dev *dev, unsigned addr, unsigned char *dest, 
 	int err;
 	int rem;
 	unsigned char tmp[64];
+	unsigned int sec;
 
-	for (;;) {
-		err = dev->transfer(dev, 1, (unsigned char *)&read_reg_command, sizeof(read_reg_command), 0, &last_trans);
-		if (!err)
-			break;
-		printf("read_reg_command err=%i, last_trans=%i\n", err, last_trans);
-		if (retry > 5) {
-			return -4;
-		}
-		retry++;
-	}
-	err = dev->transfer(dev, 3, tmp, 4, 4, &last_trans);
-	if (err) {
-		printf("r3 in err=%i, last_trans=%i  %02x %02x %02x %02x\n", err, last_trans, tmp[0], tmp[1], tmp[2], tmp[3]);
+	dbg_printf("%s: addr=%08x, cnt=%08x\n", __func__, addr, cnt);
+	err = do_command(dev, &read_reg_command, 5);
+	if (err)
 		return err;
-	}
+
+	err = do_response(dev, 3, &sec, false);
+	if (err)
+		return err;
+
 	rem = cnt;
 	retry = 0;
 	while (rem) {
@@ -623,33 +263,20 @@ static int write_memory(struct sdp_dev *dev, unsigned addr, unsigned val)
 		.cnt = BE32(0x00000004),
 		.data = BE32(val),
 		.rsvd = 0x00};
-	int retry = 0;
 	int last_trans;
 	int err = 0;
-	unsigned char tmp[64];
+	unsigned char tmp[64] = { 0 };
+	unsigned int sec;
 
 	dbg_printf("%s: addr=%08x, val=%08x\n", __func__, addr, val);
-	for (;;) {
-		err = dev->transfer(dev, 1, (unsigned char *)&write_reg_command, sizeof(write_reg_command), 0, &last_trans);
-		if (!err)
-			break;
-		printf("write_reg_command err=%i, last_trans=%i\n", err, last_trans);
-		if (retry > 5) {
-			return -4;
-		}
-		retry++;
-	}
+	err = do_command(dev, &write_reg_command, 5);
+	if (err)
+		return err;
 
-	memset(tmp, 0, sizeof(tmp));
-	err = dev->transfer(dev, 3, tmp, sizeof(tmp), 4, &last_trans);
-	dbg_printf("report 3, err=%i, last_trans=%i  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
-			err, last_trans, tmp[0], tmp[1], tmp[2], tmp[3],
-			tmp[4], tmp[5], tmp[6], tmp[7]);
-	if (err) {
-		printf("w3 in err=%i, last_trans=%i  %02x %02x %02x %02x\n", err, last_trans, tmp[0], tmp[1], tmp[2], tmp[3]);
-		printf("addr=0x%08x, val=0x%08x\n", addr, val);
-	}
-	memset(tmp, 0, sizeof(tmp));
+	err = do_response(dev, 3, &sec, false);
+	if (err)
+		return err;
+
 	err = dev->transfer(dev, 4, tmp, sizeof(tmp), 4, &last_trans);
 	dbg_printf("report 4, err=%i, last_trans=%i  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
 			err, last_trans, tmp[0], tmp[1], tmp[2], tmp[3],
@@ -659,7 +286,7 @@ static int write_memory(struct sdp_dev *dev, unsigned addr, unsigned val)
 	return err;
 }
 
-void perform_mem_work(struct sdp_dev *dev, struct mem_work *mem)
+static void perform_mem_work(struct sdp_dev *dev, struct mem_work *mem)
 {
 	unsigned tmp, tmp2;
 
@@ -684,7 +311,93 @@ void perform_mem_work(struct sdp_dev *dev, struct mem_work *mem)
 	}
 }
 
-static int write_dcd(struct sdp_dev *dev, struct ivt_header *hdr, unsigned char *file_start, unsigned cnt)
+static int do_status(struct sdp_dev *dev)
+{
+	struct sdp_command status_command = {
+		.cmd = SDP_ERROR_STATUS,
+		.addr = 0,
+		.format = 0,
+		.cnt = 0,
+		.data = 0,
+		.rsvd = 0};
+	unsigned int hab_security, status;
+	int retry = 0;
+	int err;
+
+	err = do_command(dev, &status_command, 5);
+	if (err)
+		return err;
+
+	while (retry < 5) {
+		err = do_response(dev, 3, &hab_security, false);
+		if (!err)
+			break;
+
+		retry++;
+	}
+
+	if (err)
+		return err;
+
+	printf("HAB security state: %s (0x%08x)\n", hab_security == HAB_SECMODE_PROD ?
+			"production mode" : "development mode", hab_security);
+
+	if (dev->mode == MODE_HID) {
+		err = do_response(dev, 4, &status, false);
+		if (err)
+			return err;
+	}
+
+	return 0;
+}
+
+static int do_data_transfer(struct sdp_dev *dev, unsigned char *buf, int len)
+{
+	int err;
+	int retry = 10;
+	int max = dev->max_transfer;
+	int last_trans;
+	int cnt;
+	int transferSize = 0;
+
+	while (retry) {
+		cnt = get_min(len, max);
+		err = dev->transfer(dev, 2, buf, cnt, 0, &last_trans);
+		if (!err) {
+			if (cnt > last_trans)
+				cnt = last_trans;
+			if (!cnt) {
+				printf("Nothing transferred, err=%i transferSize=%i\n", err, transferSize);
+				return -EIO;
+			}
+			transferSize += cnt;
+			buf += cnt;
+			len -= cnt;
+			if (!len)
+				return transferSize;
+			retry = 10;
+			max = dev->max_transfer;
+			continue;
+		}
+
+		printf("report 2 out err=%i, last_trans=%i len=0x%x max=0x%x retry=%i\n",
+			err, last_trans, len, max, retry);
+
+		if (max >= 16)
+			max >>= 1;
+		else
+			max <<= 1;
+
+		/* Wait a few ms before retrying transfer */
+		msleep(10);
+		retry--;
+	}
+
+	printf("Giving up\n");
+	return err;
+}
+
+static int write_dcd(struct sdp_dev *dev, struct dcd_v2 *dcd)
 {
 	struct sdp_command dl_command = {
 		.cmd = SDP_WRITE_DCD,
@@ -694,142 +407,61 @@ static int write_dcd(struct sdp_dev *dev, struct ivt_header *hdr, unsigned char 
 		.data = 0,
 		.rsvd = 0};
 
-	int length;
-#define cvt_dest_to_src		(((unsigned char *)hdr) - hdr->self_ptr)
-	unsigned char* dcd, *dcd_end;
-	unsigned char* file_end = file_start + cnt;
+	int length = BE16(dcd->header.length);
 
-	unsigned int *status;
-	int last_trans, err;
-	int retry = 0;
+	int err;
 	unsigned transferSize=0;
-	unsigned int max = dev->max_transfer;
-	unsigned char tmp[64];
-
-	if (!hdr->dcd_ptr) {
-		printf("No dcd table, barker=%x\n", hdr->barker);
-		return 0;	//nothing to do
-	}
-	dcd = hdr->dcd_ptr + cvt_dest_to_src;
-	if ((dcd < file_start) || ((dcd + 4) > file_end)) {
-		printf("bad dcd_ptr %08x\n", hdr->dcd_ptr);
-		return -1;
-	}
-
-	if ((dcd[0] != 0xd2) || (dcd[3] != 0x40)) {
-		printf("Unknown tag\n");
-		return -1;
-	}
-
-	length = (dcd[1] << 8) + dcd[2];
 
 	if (length > HAB_MAX_DCD_SIZE) {
 		printf("DCD is too big (%d bytes)\n", length);
 		return -1;
 	}
 
-	if (length == 0) {
-		printf("No DCD table, skip\n");
-		return 0;
-	}
-
 	dl_command.cnt = BE32(length);
 
-	dcd_end = dcd + length;
-	if (dcd_end > file_end) {
-		printf("bad dcd length %08x\n", length);
-		return -1;
-	}
-
 	printf("loading DCD table @%#x\n", dev->dcd_addr);
-	for (;;) {
-		err = dev->transfer(dev, 1, (unsigned char *)&dl_command, sizeof(dl_command), 0, &last_trans);
-		if (!err)
-			break;
-		printf("dl_command err=%i, last_trans=%i\n", err, last_trans);
-		if (retry > 5)
-			return -4;
-		retry++;
-	}
-	retry = 0;
+	err = do_command(dev, &dl_command, 5);
+	if (err)
+		return err;
 
-	while (length > 0) {
-		err = dev->transfer(dev, 2, dcd, get_min(length, max), 0, &last_trans);
-		if (err) {
-			printf("out err=%i, last_trans=%i cnt=0x%x max=0x%x transferSize=0x%X retry=%i\n", err, last_trans, length, max, transferSize, retry);
-			if (retry >= 10) {
-				printf("Giving up\n");
-				return err;
-			}
-			if (max >= 16)
-				max >>= 1;
-			else
-				max <<= 1;
-			/* Wait a few ms before retrying transfer */
-			msleep(10);
-			retry++;
-			continue;
-		}
-		max = dev->max_transfer;
-		retry = 0;
+	err = do_data_transfer(dev, (unsigned char *)dcd, length);
+	if (err < 0)
+		return err;
+	transferSize = err;
 
-		if (!last_trans) {
-			printf("Nothing last_trans, err=%i\n", err);
-			break;
-		}
-		dcd += last_trans;
-		length -= last_trans;
-		transferSize += last_trans;
-	}
-
-	printf("\r\n<<<%i, %i bytes>>>\r\n", length, transferSize);
+	printf("\n<<<%i, %i bytes>>>\n", length, transferSize);
 	if (dev->mode == MODE_HID) {
-		err = dev->transfer(dev, 3, tmp, sizeof(tmp), 4, &last_trans);
+		unsigned int sec, status;
+
+		err = do_response(dev, 3, &sec, false);
 		if (err)
-			printf("report 3 in err=%i, last_trans=%i  %02x %02x %02x %02x\n", err, last_trans, tmp[0], tmp[1], tmp[2], tmp[3]);
-		err = dev->transfer(dev, 4, tmp, sizeof(tmp), 4, &last_trans);
+			return err;
+
+		err = do_response(dev, 4, &status, false);
 		if (err)
-			printf("report 4 in err=%i, last_trans=%i  %02x %02x %02x %02x\n", err, last_trans, tmp[0], tmp[1], tmp[2], tmp[3]);
-		status = (unsigned int*)tmp;
-		if (*status == 0x128a8a12UL)
-			printf("succeeded (status 0x%08x)\n", *status);
+			return err;
+
+		if (status == 0x128a8a12UL)
+			printf("succeeded");
 		else
-			printf("failed (status 0x%08x)\n", *status);
+			printf("failed");
+		printf(" (security 0x%08x, status 0x%08x)\n", sec, status);
 	} else {
 		do_status(dev);
 	}
 	return transferSize;
 }
 
-static int write_dcd_table_ivt(struct sdp_dev *dev, struct ivt_header *hdr, unsigned char *file_start, unsigned cnt)
+static int write_dcd_table_ivt(struct sdp_dev *dev, struct dcd_v2 *dcdhdr)
 {
+	int length = BE16(dcdhdr->header.length);
+	unsigned char *dcd = (unsigned char *)&dcdhdr->write_dcd_command;
 	unsigned char *dcd_end;
-	unsigned m_length;
-#define cvt_dest_to_src		(((unsigned char *)hdr) - hdr->self_ptr)
-	unsigned char* dcd;
-	unsigned char* file_end = file_start + cnt;
 	int err = 0;
-	if (!hdr->dcd_ptr) {
-		printf("No dcd table, barker=%x\n", hdr->barker);
-		return 0;	//nothing to do
-	}
-	dcd = hdr->dcd_ptr + cvt_dest_to_src;
-	if ((dcd < file_start) || ((dcd + 4) > file_end)) {
-		printf("bad dcd_ptr %08x\n", hdr->dcd_ptr);
-		return -1;
-	}
-	m_length = (dcd[1] << 8) + dcd[2];
-	printf("main dcd length %x\n", m_length);
-	if ((dcd[0] != 0xd2) || (dcd[3] != 0x40)) {
-		printf("Unknown tag\n");
-		return -1;
-	}
-	dcd_end = dcd + m_length;
-	if (dcd_end > file_end) {
-		printf("bad dcd length %08x\n", m_length);
-		return -1;
-	}
-	dcd += 4;
+
+	printf("main dcd length %x\n", length);
+	dcd_end = ((unsigned char *)dcdhdr) + length;
+
 	while (dcd < dcd_end) {
 		unsigned s_length = (dcd[1] << 8) + dcd[2];
 		unsigned sub_tag = (dcd[0] << 24) + (dcd[3] & 0x7);
@@ -914,7 +546,7 @@ static int write_dcd_table_ivt(struct sdp_dev *dev, struct ivt_header *hdr, unsi
 	return err;
 }
 
-static int get_dcd_range_old(struct old_app_header *hdr,
+static int get_dcd_range_old(struct flash_header_v1 *hdr,
 		unsigned char *file_start, unsigned cnt,
 		unsigned char **pstart, unsigned char **pend)
 {
@@ -927,7 +559,7 @@ static int get_dcd_range_old(struct old_app_header *hdr,
 
 	if (!hdr->dcd_ptr) {
 		printf("No dcd table, barker=%x\n", hdr->app_barker);
-		*pstart = *pend = ((unsigned char *)hdr) + sizeof(struct old_app_header);
+		*pstart = *pend = ((unsigned char *)hdr) + sizeof(struct flash_header_v1);
 		return 0;	//nothing to do
 	}
 	dcd = hdr->dcd_ptr + cvt_dest_to_src_old;
@@ -954,7 +586,7 @@ static int get_dcd_range_old(struct old_app_header *hdr,
 	return 0;
 }
 
-static int write_dcd_table_old(struct sdp_dev *dev, struct old_app_header *hdr, unsigned char *file_start, unsigned cnt)
+static int write_dcd_table_old(struct sdp_dev *dev, struct flash_header_v1 *hdr, unsigned char *file_start, unsigned cnt)
 {
 	unsigned val;
 	unsigned char *dcd_end;
@@ -980,7 +612,7 @@ static int write_dcd_table_old(struct sdp_dev *dev, struct old_app_header *hdr, 
 	return err;
 }
 
-void diff_long(unsigned char *src1, unsigned char *src2, unsigned cnt, unsigned skip)
+static void diff_long(unsigned char *src1, unsigned char *src2, unsigned cnt, unsigned skip)
 {
 	unsigned char buf[8*9 + 2];
 	unsigned *s1 = (unsigned *)src1;
@@ -1075,42 +707,64 @@ void dump_bytes(unsigned char *src, unsigned cnt, unsigned addr)
 	}
 }
 
-int verify_memory(struct sdp_dev *dev, FILE *xfile, unsigned offset,
-		unsigned addr, unsigned size, unsigned char *verify_buffer,
-		unsigned verify_cnt)
+static void fetch_data(struct load_desc *ld, unsigned foffset, unsigned char **p, unsigned *cnt)
+{
+	unsigned skip = foffset - ld->header_offset;
+	unsigned buf_cnt = ld->buf_cnt;
+
+	if ((ld->curr->jump_mode >= J_ADDR_HEADER) &&
+			(skip < sizeof(ld->writeable_header))) {
+		*p = &ld->writeable_header[skip];
+		*cnt = sizeof(ld->writeable_header) - skip;
+		return;
+	}
+	skip = foffset - ld->buf_offset;
+	if (skip >= buf_cnt) {
+		fseek(ld->xfile, foffset, SEEK_SET);
+		ld->buf_offset = foffset;
+		buf_cnt = ld->buf_cnt = fread(ld->buf_start, 1, ld->buf_size, ld->xfile);
+		skip = 0;
+	}
+	if ((foffset < ld->header_offset) &&
+	    (ld->header_offset < ld->buf_offset + buf_cnt))
+		buf_cnt = ld->header_offset - ld->buf_offset;
+	*p = &ld->buf_start[skip];
+	*cnt = buf_cnt - skip;
+}
+
+static int verify_memory(struct sdp_dev *dev, struct load_desc *ld, unsigned foffset,
+		unsigned size)
 {
 	int mismatch = 0;
-	unsigned char file_buf[1024];
 	unsigned verified = 0;
 	unsigned total = size;
-	fseek(xfile, offset + verify_cnt, SEEK_SET);
+	unsigned addr = ld->dladdr;
 
 	while (size) {
+		unsigned char *p;
+		unsigned cnt;
 		unsigned char mem_buf[64];
-		unsigned char *p = file_buf;
-		int cnt = addr & 0x3f;
-		int request = get_min(size, sizeof(file_buf));
-		if (cnt) {
-			cnt = 64 - cnt;
-			if (request > cnt)
-				request = cnt;
+		int align_cnt = foffset & 0x3f;
+		unsigned offset = foffset;
+
+		fetch_data(ld, foffset, &p, &cnt);
+		if (align_cnt) {
+			align_cnt = 64 - align_cnt;
+			if (cnt > align_cnt)
+				cnt = align_cnt;
 		}
-		if (verify_cnt) {
-			p = verify_buffer;
-			cnt = (int)get_min(request, (int)verify_cnt);
-			verify_buffer += cnt;
-			verify_cnt -= cnt;
-		} else {
-			cnt = fread(p, 1, request, xfile);
-			if (cnt <= 0) {
-				printf("Unexpected end of file, request=0x%0x, size=0x%x, cnt=%i\n", request, size, cnt);
-				return -1;
-			}
+		if (cnt <= 0) {
+			printf("Unexpected end of file, size=0x%x, cnt=%i\n", size, cnt);
+			return -1;
 		}
+		if (cnt > size)
+			cnt = size;
 		size -= cnt;
+		foffset += cnt;
 		while (cnt) {
 			int ret;
-			request = get_min(cnt, sizeof(mem_buf));
+			unsigned request = get_min(cnt, sizeof(mem_buf));
+
 			ret = read_memory(dev, addr, mem_buf, request);
 			if (ret < 0) {
 				printf("verified 0x%x of 0x%x before usb error\n", verified, total);
@@ -1153,529 +807,695 @@ int verify_memory(struct sdp_dev *dev, FILE *xfile, unsigned offset,
 	return mismatch ? -1 : 0;
 }
 
-int is_header(struct sdp_dev *dev, unsigned char *p)
-{
-	switch (dev->header_type) {
-	case HDR_MX51:
-	{
-		struct old_app_header *ohdr = (struct old_app_header *)p;
-		if (ohdr->app_barker == 0xb1)
-			return 1;
-		break;
-	}
-	case HDR_MX53:
-	{
-		struct ivt_header *hdr = (struct ivt_header *)p;
-		if (hdr->barker == IVT_BARKER)
-			return 1;
-	}
-	}
-	return 0;
-}
-
-int perform_dcd(struct sdp_dev *dev, unsigned char *p, unsigned char *file_start, unsigned cnt)
-{
-	int ret = 0;
-	switch (dev->header_type) {
-	case HDR_MX51:
-	{
-		struct old_app_header *ohdr = (struct old_app_header *)p;
-		ret = write_dcd_table_old(dev, ohdr, file_start, cnt);
-		dbg_printf("dcd_ptr=0x%08x\n", ohdr->dcd_ptr);
-#if 1
-		ohdr->dcd_ptr = 0;
-#endif
-		if (ret < 0)
-			return ret;
-		break;
-	}
-	case HDR_MX53:
-	{
-		struct ivt_header *hdr = (struct ivt_header *)p;
-		if (dev->mode == MODE_HID) {
-			ret = write_dcd(dev, hdr, file_start, cnt);
-		} else {
-			// For processors that don't support the WRITE_DCD command (i.MX5x)
-			ret = write_dcd_table_ivt(dev, hdr, file_start, cnt);
-		}
-		dbg_printf("dcd_ptr=0x%08x\n", hdr->dcd_ptr);
-#if 1
-		hdr->dcd_ptr = 0;
-#endif
-		if (ret < 0)
-			return ret;
-		break;
-	}
-	}
-	return 0;
-}
-
-int clear_dcd_ptr(struct sdp_dev *dev, unsigned char *p, unsigned char *file_start, unsigned cnt)
-{
-	switch (dev->header_type) {
-	case HDR_MX51:
-	{
-		struct old_app_header *ohdr = (struct old_app_header *)p;
-		printf("clear dcd_ptr=0x%08x\n", ohdr->dcd_ptr);
-		ohdr->dcd_ptr = 0;
-		break;
-	}
-	case HDR_MX53:
-	{
-		struct ivt_header *hdr = (struct ivt_header *)p;
-		printf("clear dcd_ptr=0x%08x\n", hdr->dcd_ptr);
-		hdr->dcd_ptr = 0;
-		break;
-	}
-	}
-	return 0;
-}
-
-#ifndef offsetof
-#define offsetof(TYPE, MEMBER) __builtin_offsetof(TYPE, MEMBER)
-//#define offsetof(TYPE, MEMBER) ((size_t) &((TYPE *)0)->MEMBER)
-#endif
-
-int get_dl_start(struct sdp_dev *dev, unsigned char *p, unsigned char *file_start, unsigned cnt, unsigned *dladdr, unsigned *max_length, unsigned *plugin, unsigned *header_addr, unsigned int clear_boot_data)
-{
-	unsigned char* file_end = file_start + cnt;
-	switch (dev->header_type) {
-	case HDR_MX51:
-	{
-		struct old_app_header *ohdr = (struct old_app_header *)p;
-		unsigned char *dcd_end;
-		unsigned char* dcd;
-		int err = get_dcd_range_old(ohdr, file_start, cnt, &dcd, &dcd_end);
-		*dladdr = ohdr->app_dest_ptr;
-		*header_addr = ohdr->dcd_ptr_ptr - offsetof(struct old_app_header, dcd_ptr);
-		*plugin = 0;
-		if (err >= 0) {
-			*max_length = dcd_end[0] | (dcd_end[1] << 8) | (dcd_end[2] << 16) | (dcd_end[3] << 24);
-		}
-		break;
-	}
-	case HDR_MX53:
-	{
-		unsigned char *bd;
-		struct ivt_header *hdr = (struct ivt_header *)p;
-		*dladdr = hdr->self_ptr;
-		*header_addr = hdr->self_ptr;
-		bd = hdr->boot_data_ptr + cvt_dest_to_src;
-		if ((bd < file_start) || ((bd + 4) > file_end)) {
-			printf("bad boot_data_ptr %08x\n", hdr->boot_data_ptr);
-			return -1;
-		}
-		*dladdr = ((struct boot_data *)bd)->dest;
-		*max_length = ((struct boot_data *)bd)->image_len;
-		*plugin = ((struct boot_data *)bd)->plugin;
-		((struct boot_data *)bd)->plugin = 0;
-		if (clear_boot_data) {
-			printf("Setting boot_data_ptr to 0\n");
-			hdr->boot_data_ptr = 0;
-		}
-		break;
-	}
-	}
-	return 0;
-}
-
-int do_status(struct sdp_dev *dev)
-{
-	struct sdp_command status_command = {
-		.cmd = SDP_ERROR_STATUS,
-		.addr = 0,
-		.format = 0,
-		.cnt = 0,
-		.data = 0,
-		.rsvd = 0};
-
-	int last_trans;
-	unsigned int *hab_security;
-	unsigned char tmp[64];
-	int retry = 0;
-	int err;
-	int cnt = 64;
-
-	for (;;) {
-		err = dev->transfer(dev, 1, (unsigned char *)&status_command, sizeof(status_command), 0, &last_trans);
-		dbg_printf("report 1, wrote %i bytes, err=%i\n", last_trans, err);
-		memset(tmp, 0, sizeof(tmp));
-
-
-		err = dev->transfer(dev, 3, tmp, cnt, 4, &last_trans);
-		dbg_printf("report 3, read %i bytes, err=%i\n", last_trans, err);
-		dbg_printf("read=%02x %02x %02x %02x\n", tmp[0], tmp[1], tmp[2], tmp[3]);
-		if (!err)
-			break;
-		retry++;
-		if (retry > 5)
-			break;
-	}
-
-	hab_security = (unsigned int *)tmp;
-	printf("HAB security state: %s (0x%08x)\n", *hab_security == HAB_SECMODE_PROD ?
-			"production mode" : "development mode", *hab_security);
-
-	if (dev->mode == MODE_HID) {
-		err = dev->transfer(dev, 4, tmp, cnt, 4, &last_trans);
-		dbg_printf("report 4, read %i bytes, err=%i\n", last_trans, err);
-		dbg_printf("read=%02x %02x %02x %02x\n", tmp[0], tmp[1], tmp[2], tmp[3]);
-	}
-	return err;
-}
-
-int process_header(struct sdp_dev *dev, struct sdp_work *curr,
-		unsigned char *buf, int cnt, unsigned *p_dladdr,
-		unsigned *p_max_length, unsigned *p_plugin,
-		unsigned *p_header_addr)
-{
-	int ret;
-	unsigned header_max = 0x800;
-	unsigned header_inc = 0x400;
-	unsigned header_offset = 0;
-	int header_cnt = 0;
-	unsigned char *p = buf;
-
-	while (header_offset < header_max) {
-//		printf("header_offset=%x\n", header_offset);
-		if (is_header(dev, p)) {
-			ret = get_dl_start(dev, p, buf, cnt, p_dladdr, p_max_length, p_plugin,
-					p_header_addr, curr->clear_boot_data);
-			if (ret < 0) {
-				printf("!!get_dl_start returned %i\n", ret);
-				return ret;
-			}
-			if (curr->dcd) {
-				ret = perform_dcd(dev, p, buf, cnt);
-				if (ret < 0) {
-					printf("!!perform_dcd returned %i\n", ret);
-					return ret;
-				}
-				curr->dcd = 0;
-				if ((!curr->jump_mode) && (!curr->plug)) {
-					printf("!!dcd done, nothing else requested\n");
-					return 0;
-				}
-			}
-			if (curr->clear_dcd) {
-				ret = clear_dcd_ptr(dev, p, buf, cnt);
-				if (ret < 0) {
-					printf("!!clear_dcd returned %i\n", ret);
-					return ret;
-				}
-			}
-			if (*p_plugin && (!curr->plug) && (!header_cnt)) {
-				header_cnt++;
-				header_max = header_offset + *p_max_length + 0x400;
-				if (header_max > (unsigned)(cnt - 32))
-					header_max = (unsigned)(cnt - 32);
-				printf("header_max=%x\n", header_max);
-				header_inc = 4;
-			} else {
-				if (!*p_plugin)
-					curr->plug = 0;
-				break;
-			}
-		}
-		header_offset += header_inc;
-		p += header_inc;
-	}
-	return header_offset;
-}
-
-int load_file(struct sdp_dev *dev,
-		unsigned char *p, int cnt, unsigned char *buf, unsigned buf_cnt,
-		unsigned dladdr, unsigned fsize, unsigned char type, FILE* xfile)
+static int load_file(struct sdp_dev *dev, struct load_desc *ld, unsigned foffset,
+		unsigned fsize, unsigned char type)
 {
 	struct sdp_command dl_command = {
 		.cmd = SDP_WRITE_FILE,
-		.addr = BE32(dladdr),
+		.addr = BE32(ld->dladdr),
 		.format = 0,
 		.cnt = BE32(fsize),
 		.data = 0,
 		.rsvd = type};
-	unsigned int *status;
-	int last_trans, err;
-	int retry = 0;
+	int err;
 	unsigned transferSize=0;
-	int max = dev->max_transfer;
-	unsigned char tmp[64];
+	unsigned char *p;
+	unsigned cnt;
+	unsigned char combine_buf[1024];
 
-	for (;;) {
-		err = dev->transfer(dev, 1, (unsigned char *)&dl_command, sizeof(dl_command), 0, &last_trans);
+	do_command(dev, &dl_command, 5);
+
+	if (dev->mode == MODE_BULK) {
+		unsigned int sec;
+		err = do_response(dev, 3, &sec, false);
+		if (err)
+			return err;
+	}
+
+	while (transferSize < fsize) {
+		unsigned remaining = (fsize-transferSize);
+
+		fetch_data(ld, foffset, &p, &cnt);
+		/* Avoid short packets, they may signal end of transfer */
+		if (cnt < sizeof(combine_buf)) {
+			unsigned next_cnt;
+
+			memcpy(combine_buf, p, cnt);
+			while (cnt < sizeof(combine_buf)) {
+				fetch_data(ld, foffset + cnt, &p, &next_cnt);
+				if (!next_cnt)
+					break;
+				if (next_cnt > sizeof(combine_buf) - cnt)
+					next_cnt = sizeof(combine_buf) - cnt;
+				memcpy(&combine_buf[cnt], p, next_cnt);
+				cnt += next_cnt;
+			}
+			p = combine_buf;
+			dbg_dump_long(p, cnt, ld->dladdr + transferSize, 0);
+		} else {
+			cnt &= -sizeof(combine_buf);	/* round down to multiple of 1024 */
+		}
+		if (cnt > remaining)
+			cnt = remaining;
+		if (!cnt)
+			break;
+		dbg_printf("%s:foffset=%x, cnt=%x, remaining=%x\n", __func__, foffset, cnt, remaining);
+		err = do_data_transfer(dev, p, cnt);
+		if (err < 0)
+			return err;
 		if (!err)
 			break;
-		printf("dl_command err=%i, last_trans=%i\n", err, last_trans);
-		if (retry > 5)
-			return -4;
-		retry++;
+		transferSize += err;
+		foffset += err;
 	}
-	retry = 0;
-	if (dev->mode == MODE_BULK) {
-		err = dev->transfer(dev, 3, tmp, sizeof(tmp), 4, &last_trans);
-		if (err)
-			printf("in err=%i, last_trans=%i  %02x %02x %02x %02x\n", err, last_trans, tmp[0], tmp[1], tmp[2], tmp[3]);
-	}
-
-	while (1) {
-		int retry;
-		if (cnt > (int)(fsize-transferSize)) cnt = (fsize-transferSize);
-		if (cnt <= 0)
-			break;
-		retry = 0;
-		while (cnt) {
-			err = dev->transfer(dev, 2, p, get_min(cnt, max), 0, &last_trans);
-//			printf("err=%i, last_trans=0x%x, cnt=0x%x, max=0x%x\n", err, last_trans, cnt, max);
-			if (err) {
-				printf("out err=%i, last_trans=%i cnt=0x%x max=0x%x transferSize=0x%X retry=%i\n", err, last_trans, cnt, max, transferSize, retry);
-				if (retry >= 10) {
-					printf("Giving up\n");
-					return err;
-				}
-				if (max >= 16)
-					max >>= 1;
-				else
-					max <<= 1;
-				msleep(10);
-				retry++;
-				continue;
-			}
-			max = dev->max_transfer;
-			retry = 0;
-			if (cnt < last_trans) {
-				dbg_printf("note: last_trans=0x%x, attempted only=0%x\n", last_trans, cnt);
-				cnt = last_trans;
-			}
-			if (!last_trans) {
-				printf("Nothing last_trans, err=%i\n", err);
-				break;
-			}
-			p += last_trans;
-			cnt -= last_trans;
-			transferSize += last_trans;
-		}
-
-		if (!last_trans) break;
-		if (feof(xfile)) break;
-		cnt = fsize - transferSize;
-		if (cnt <= 0)
-			break;
-		cnt = fread(buf, 1 , get_min(cnt, (int)buf_cnt), xfile);
-		p = buf;
-	}
-	printf("\r\n<<<%i, %i bytes>>>\r\n", fsize, transferSize);
+	printf("\n<<<%i, %i bytes>>>\n", fsize, transferSize);
 	if (dev->mode == MODE_HID) {
-		err = dev->transfer(dev, 3, tmp, sizeof(tmp), 4, &last_trans);
+		unsigned int sec, status;
+
+		err = do_response(dev, 3, &sec, false);
 		if (err)
-			printf("report 3 in err=%i, last_trans=%i  %02x %02x %02x %02x\n", err, last_trans, tmp[0], tmp[1], tmp[2], tmp[3]);
-		err = dev->transfer(dev, 4, tmp, sizeof(tmp), 4, &last_trans);
+			return err;
+
+		err = do_response(dev, 4, &status, false);
 		if (err)
-			printf("report 4 in err=%i, last_trans=%i  %02x %02x %02x %02x\n", err, last_trans, tmp[0], tmp[1], tmp[2], tmp[3]);
-		status = (unsigned int*)tmp;
-		if (*status == 0x88888888UL)
-			printf("succeeded (status 0x%08x)\n", *status);
+			return err;
+
+		if (status == 0x88888888UL)
+			printf("succeeded");
 		else
-			printf("failed (status 0x%08x)\n", *status);
+			printf("failed");
+		printf(" (security 0x%08x, status 0x%08x)\n", sec, status);
 	} else {
 		do_status(dev);
 	}
 	return transferSize;
 }
 
-#define MAX_IN_LENGTH 100 // max length for user input strings
-
-#define FT_APP	0xaa
-#define FT_CSF	0xcc
-#define FT_DCD	0xee
-#define FT_LOAD_ONLY	0x00
-int DoIRomDownload(struct sdp_dev *dev, struct sdp_work *curr, int verify)
+static int jump(struct sdp_dev *dev, unsigned int header_addr)
 {
-//							address, format, data count, data, type
-	//static unsigned char jump_command[] = {0x0b,0x0b, V(0),  0x00, V(0x00000000), V(0), 0x00};
+	int err;
 	struct sdp_command jump_command = {
 		.cmd = SDP_JUMP_ADDRESS,
-		.addr = 0,
+		.addr = BE32(header_addr),
 		.format = 0,
 		.cnt = 0,
 		.data = 0,
 		.rsvd = 0x00};
+	unsigned int sec, status;
 
+	printf("jumping to 0x%08x\n", header_addr);
+	err = do_command(dev, &jump_command, 5);
+	if (err)
+		return err;
+
+	err = do_response(dev, 3, &sec, false);
+	if (err)
+		return err;
+
+	err = do_response(dev, 4, &status, true);
+	/*
+	 * Documentation says: "This report is sent by device only in case of
+	 * an error jumping to the given address..."
+	 * If Report 4 fails, this is a good sign
+	 * If Report 4 responds, there has been something gone wrong...
+	 */
+	if (!err) {
+		printf("failed (security 0x%08x, status 0x%08x)\n", sec, status);
+		return err;
+	}
+
+	return 0;
+}
+
+static int load_file_from_desc(struct sdp_dev *dev, struct sdp_work *curr,
+		struct load_desc *ld)
+{
 	int ret;
-	FILE* xfile;
-	unsigned char type;
-	unsigned fsize;
-	unsigned header_offset;
-	int cnt;
 	unsigned file_base;
-	int last_trans, err;
-#define BUF_SIZE (1024*16)
-	unsigned char *buf = NULL;
-	unsigned char *verify_buffer = NULL;
-	unsigned verify_cnt;
-	unsigned char *p;
-	unsigned char tmp[64];
-	unsigned dladdr = 0;
-	unsigned max_length;
-	unsigned plugin = 0;
-	unsigned header_addr = 0;
-
+	unsigned char type;
 	unsigned skip = 0;
+	unsigned fsize;
 	unsigned transferSize=0;
-	int retry = 0;
+	unsigned cnt;
 
-	print_sdp_work(curr);
-	xfile = fopen(curr->filename, "rb" );
-	if (!xfile) {
-		printf("\r\nerror, can not open input file: %s\r\n", curr->filename);
-		return -5;
+	if (!ld->dladdr) {
+		printf("\nunknown load address\n");
+		return -3;
 	}
-	buf = malloc(BUF_SIZE);
-	if (!buf) {
-		printf("\r\nerror, out of memory\r\n");
-		ret = -2;
+
+	type = (curr->plug || curr->jump_mode) ? FT_APP : FT_LOAD_ONLY;
+	if (dev->mode == MODE_BULK && type == FT_APP) {
+		/*
+		 * There is no jump command.  boot ROM requires the download
+		 * to start at header address
+		 */
+		ld->dladdr = ld->header_addr;
+	}
+	if (ld->verify) {
+		if ((type == FT_APP) && (dev->mode != MODE_HID)) {
+			type = FT_LOAD_ONLY;
+			ld->verify = 2;
+		}
+	}
+	file_base = ld->header_addr - ld->header_offset;
+	if (file_base > ld->dladdr) {
+		ld->max_length -= (file_base - ld->dladdr);
+		ld->dladdr = file_base;
+	}
+	dbg_printf("skip=%x cnt=%x dladdr=%x file_base=%x fsize=%x max_length=%x\n", skip, ld->buf_cnt, ld->dladdr, file_base, ld->fsize, ld->max_length);
+	skip = ld->dladdr - file_base;
+	fsize = ld->fsize;
+	if (skip > fsize) {
+		printf("skip(0x%08x) > fsize(0x%08x) file_base=0x%08x, header_offset=0x%x\n",
+				skip, fsize, file_base, ld->header_offset);
+		ret = -4;
 		goto cleanup;
 	}
-	fsize = get_file_size(xfile);
-	if (curr->load_size && (fsize > curr->load_size))
-		fsize = curr->load_size;
-	cnt = fread(buf, 1 , BUF_SIZE, xfile);
+	fsize -= skip;
+	if (fsize > ld->max_length)
+		fsize = ld->max_length;
+	printf("\nloading binary file(%s) to %08x, skip=%x, fsize=%x type=%x\n", curr->filename, ld->dladdr, skip, fsize, type);
 
-	if (cnt < 0x20) {
-		printf("\r\nerror, file: %s is too small\r\n", curr->filename);
-		ret = -2;
+	ret = load_file(dev, ld, skip, fsize, type);
+	if (ret < 0)
 		goto cleanup;
-	}
-	max_length = fsize;
-	if (curr->dcd || curr->clear_dcd || curr->plug || (curr->jump_mode >= J_HEADER)) {
-		ret = process_header(dev, curr, buf, cnt,
-				&dladdr, &max_length, &plugin, &header_addr);
+	transferSize = ret;
+
+	if (ld->verify) {
+		ret = verify_memory(dev, ld, skip, fsize);
 		if (ret < 0)
 			goto cleanup;
-		header_offset = ret;
+		if (ld->verify == 2) {
+			cnt = fsize;
+			if (cnt > 64)
+				cnt = 64;
+			/*
+			 * This will set the right header address
+			 * for bulk mode, which has no jump command
+			 */
+			ret = load_file(dev, ld, ld->header_offset, cnt,
+					FT_APP);
+			if (ret < 0)
+				goto cleanup;
+
+		}
+	}
+
+	ret = (fsize <= transferSize) ? 0 : -16;
+cleanup:
+	return ret;
+}
+
+static int is_header(struct sdp_dev *dev, unsigned char *p)
+{
+	switch (dev->header_type) {
+	case HDR_MX51:
+	{
+		struct flash_header_v1 *hdr = (struct flash_header_v1 *)p;
+		if (hdr->app_barker == 0xb1)
+			return 1;
+		break;
+	}
+	case HDR_MX53:
+	{
+		struct flash_header_v2 *hdr = (struct flash_header_v2 *)p;
+		struct ivt_header *ivt = &hdr->header;
+		if (ivt->tag == IVT_HEADER_TAG &&
+		    (ivt->version == IVT_VERSION || ivt->version == IVT_VERSION_IMX8M))
+			return 1;
+	}
+	case HDR_UBOOT:
+	{
+		image_header_t *image = (image_header_t *)p;
+		if (BE32(image->ih_magic) == IH_MAGIC)
+			return 1;
+	}
+	}
+	return 0;
+}
+
+static void init_header(struct sdp_dev *dev, struct load_desc *ld)
+{
+	struct sdp_work *curr = ld->curr;
+
+	memset(ld->writeable_header, 0, sizeof(ld->writeable_header));
+
+	switch (dev->header_type) {
+	case HDR_MX51:
+	{
+		struct flash_header_v1 *hdr = (struct flash_header_v1 *)ld->writeable_header;
+		unsigned char *p = (unsigned char *)(hdr + 1);
+		unsigned size;
+		unsigned extra_space = ((sizeof(struct flash_header_v1) + 4 - 1) | 0x3f) + 1;
+
+		ld->max_length += extra_space;
+		size = ld->max_length;
+
+		hdr->app_start_addr = curr->jump_addr;
+		hdr->app_barker = APP_BARKER;
+		hdr->dcd_ptr_ptr = ld->header_addr + offsetof(struct flash_header_v1, dcd_ptr);
+		hdr->app_dest_ptr = ld->dladdr;
+
+		*p++ = (unsigned char)size;
+		size >>= 8;
+		*p++ = (unsigned char)size;
+		size >>= 8;
+		*p++ = (unsigned char)size;
+		size >>= 8;
+		*p = (unsigned char)size;
+		break;
+	}
+	case HDR_MX53:
+	{
+		struct flash_header_v2 *hdr = (struct flash_header_v2 *)ld->writeable_header;
+		struct boot_data *bd = (struct boot_data *)(hdr+1);
+		unsigned extra_space = ((sizeof(struct flash_header_v2) + sizeof(struct boot_data) - 1) | 0x3f) + 1;
+
+		hdr->header.tag = IVT_HEADER_TAG;
+		hdr->header.length = BE16(sizeof(*hdr));
+		hdr->header.version = IVT_VERSION;
+		hdr->start_addr = curr->jump_addr;
+		hdr->boot_data_ptr = ld->header_addr + sizeof(*hdr);
+		hdr->self_ptr = ld->header_addr;
+		bd->dest = ld->dladdr;
+		ld->max_length += extra_space;
+		bd->image_len = ld->max_length;
+		break;
+	}
+	case HDR_UBOOT:
+	{
+		break;
+	}
+	}
+}
+
+/*
+ * Apply/load DCD table for v1 and v2 flash headers
+ *
+ * Returns 0 if successful or if there was no DCD table to download
+ * Returns -1 if the DCD table is invalid
+ */
+static int perform_dcd(struct sdp_dev *dev, unsigned char *p, unsigned char *file_start, unsigned cnt)
+{
+	int ret = 0;
+	switch (dev->header_type) {
+	case HDR_MX51:
+	{
+		struct flash_header_v1 *hdr = (struct flash_header_v1 *)p;
+		ret = write_dcd_table_old(dev, hdr, file_start, cnt);
+		dbg_printf("dcd_ptr=0x%08x\n", hdr->dcd_ptr);
+		if (ret < 0)
+			return ret;
+		break;
+	}
+	case HDR_MX53:
+	{
+#define cvt_dest_to_src		(((unsigned char *)hdr) - hdr->self_ptr)
+		struct flash_header_v2 *hdr = (struct flash_header_v2 *)p;
+		unsigned char* file_end = file_start + cnt;
+		unsigned char *dcd_end, *dcd_start;
+		struct dcd_v2 *dcd;
+		int length;
+
+		if (!hdr->dcd_ptr) {
+			printf("No DCD table\n");
+			return 0;	//nothing to do
+		}
+
+		dcd_start = hdr->dcd_ptr + cvt_dest_to_src;
+		if ((dcd_start < file_start) || (dcd_start + 4) > file_end) {
+			printf("bad dcd_ptr %08x\n", hdr->dcd_ptr);
+			return -1;
+		}
+
+		dcd = (struct dcd_v2 *)dcd_start;
+		if (dcd->header.tag != DCD_HEADER_TAG ||
+		    dcd->header.version != DCD_VERSION) {
+			printf("Unknown DCD header tag/version\n");
+			return -1;
+		}
+
+		length = BE16(dcd->header.length);
+		if (length == 0) {
+			printf("No DCD table, skip\n");
+			return 0;
+		}
+
+		/* Check whether DCD length is longer than file */
+		dcd_end = ((unsigned char *)dcd) + length;
+		if (dcd_end > file_end) {
+			printf("Bad dcd length 0x%08x\n", length);
+			return -1;
+		}
+
+		if (dev->mode == MODE_HID) {
+			ret = write_dcd(dev, dcd);
+		} else {
+			// For processors that don't support the WRITE_DCD command (i.MX5x)
+			ret = write_dcd_table_ivt(dev, dcd);
+		}
+		dbg_printf("dcd_ptr=0x%08x\n", hdr->dcd_ptr);
+		if (ret < 0)
+			return ret;
+		break;
+	}
+	}
+	return 0;
+}
+
+static int clear_dcd_ptr(struct sdp_dev *dev, unsigned char *p)
+{
+	switch (dev->header_type) {
+	case HDR_MX51:
+	{
+		struct flash_header_v1 *hdr = (struct flash_header_v1 *)p;
+		if (hdr->dcd_ptr) {
+			printf("clear dcd_ptr=0x%08x\n", hdr->dcd_ptr);
+			hdr->dcd_ptr = 0;
+		}
+		break;
+	}
+	case HDR_MX53:
+	{
+		struct flash_header_v2 *hdr = (struct flash_header_v2 *)p;
+		if (hdr->dcd_ptr) {
+			printf("clear dcd_ptr=0x%08x\n", hdr->dcd_ptr);
+			hdr->dcd_ptr = 0;
+		}
+		break;
+	}
+	}
+	return 0;
+}
+
+static int get_dl_start(struct sdp_dev *dev, unsigned char *p,
+	struct load_desc *ld, unsigned int clear_boot_data)
+{
+	unsigned char* file_end = ld->buf_start + ld->buf_cnt;
+	switch (dev->header_type) {
+	case HDR_MX51:
+	{
+		struct flash_header_v1 *hdr = (struct flash_header_v1 *)p;
+		unsigned char *dcd_end;
+		unsigned char* dcd;
+		int err = get_dcd_range_old(hdr, ld->buf_start, ld->buf_cnt, &dcd, &dcd_end);
+		ld->dladdr = hdr->app_dest_ptr;
+		ld->header_addr = hdr->dcd_ptr_ptr - offsetof(struct flash_header_v1, dcd_ptr);
+		ld->plugin = 0;
+		if (err >= 0) {
+			ld->max_length = dcd_end[0] | (dcd_end[1] << 8) | (dcd_end[2] << 16) | (dcd_end[3] << 24);
+		}
+		break;
+	}
+	case HDR_MX53:
+	{
+		struct boot_data *bd;
+		unsigned char* p1;
+		uint32_t *bd1;
+		unsigned offset;
+		struct flash_header_v2 *hdr = (struct flash_header_v2 *)p;
+
+		ld->dladdr = hdr->self_ptr;
+		ld->header_addr = hdr->self_ptr;
+		p1 = (hdr->boot_data_ptr + cvt_dest_to_src);
+
+		if ((p1 < ld->buf_start) || ((p1 + 4) > file_end)) {
+			printf("bad boot_data_ptr %08x\n", hdr->boot_data_ptr);
+			return -1;
+		}
+		bd = (struct boot_data *)p1;
+		ld->dladdr = bd->dest;
+		ld->max_length = bd->image_len;
+		ld->plugin = bd->plugin;
+		offset = ((unsigned char *)&bd->plugin) - p;
+		if (offset <= sizeof(ld->writeable_header) - 4) {
+			bd1 = (uint32_t *)(ld->writeable_header + offset);
+			*bd1 = 0;
+		} else {
+			printf("Can't clear plugin flag\n");
+		}
+		if (clear_boot_data) {
+			printf("Setting boot_data_ptr to 0\n");
+			hdr->boot_data_ptr = 0;
+		}
+		break;
+	}
+	case HDR_UBOOT:
+	{
+		image_header_t *hdr = (image_header_t *)p;
+		ld->dladdr = BE32(hdr->ih_load) - sizeof(image_header_t);
+		ld->header_addr = ld->dladdr;
+	}
+	}
+	return 0;
+}
+
+static unsigned offset_search_list[] = {0, 0x400, 0x8400};
+
+static int process_header(struct sdp_dev *dev, struct sdp_work *curr,
+		struct load_desc *ld)
+{
+	int ret;
+	unsigned header_max = 0x800 + curr->load_skip;
+	unsigned header_inc = 0;
+	unsigned search_index = 0;
+	int header_cnt = 0;
+	unsigned char *p;
+	int hdmi_ivt = 0;
+	int save_verify;
+	int found = 0;
+
+	while (1) {
+		if (header_inc) {
+			ld->header_offset += header_inc;
+			if (ld->header_offset >= header_max)
+				break;
+		} else {
+			if (search_index >= ARRAY_SIZE(offset_search_list))
+				break;
+			ld->header_offset = curr->load_skip + offset_search_list[search_index++];
+		}
+		if ((ld->header_offset < ld->buf_offset) ||
+				(ld->header_offset - ld->buf_offset + 32 > ld->buf_cnt)) {
+			fseek(ld->xfile, ld->header_offset, SEEK_SET);
+			ld->buf_offset = ld->header_offset;
+			ld->buf_cnt = fread(ld->buf_start, 1, ld->buf_size, ld->xfile);
+			if (ld->buf_cnt < 32)
+				break;
+		}
+		p = ld->buf_start + ld->header_offset - ld->buf_offset;
+		if (!is_header(dev, p))
+			continue;
+		dbg_printf("%s: header_offset=%x, %02x%02x%02x%02x\n", __func__,
+			ld->header_offset, p[3], p[2], p[1], p[0]);
+
+		memcpy(ld->writeable_header, p,
+				sizeof(ld->writeable_header));
+		ret = get_dl_start(dev, p, ld, curr->clear_boot_data);
+		if (ret < 0) {
+			printf("!!get_dl_start returned %i\n", ret);
+			return ret;
+		}
+		if (curr->dcd) {
+			ret = perform_dcd(dev, p, ld->buf_start, ld->buf_cnt);
+#if 1
+			clear_dcd_ptr(dev, ld->writeable_header);
+#endif
+			if (ret < 0) {
+				printf("!!perform_dcd returned %i\n", ret);
+				return ret;
+			}
+			curr->dcd = 0;
+			if ((!curr->jump_mode) && (!curr->plug)) {
+				printf("!!dcd done, nothing else requested\n");
+				return 0;
+			}
+		}
+		if (curr->clear_dcd) {
+			ret = clear_dcd_ptr(dev, ld->writeable_header);
+			if (ret < 0) {
+				printf("!!clear_dcd returned %i\n", ret);
+				return ret;
+			}
+		}
+		if (ld->plugin & HDMI_IMAGE_FLAG_MASK) {
+			if (!hdmi_ivt) {
+				hdmi_ivt++;
+				header_inc = 0x1c00 - 0x1000 + ld->max_length;
+				header_max = ld->header_offset + header_inc + 0x400;
+				continue;
+			}
+			if (curr->plug) {
+				save_verify = ld->verify;
+				/* Trying to verify hdmi firmware gives errors! */
+				ld->verify = 0;
+				ret = load_file_from_desc(dev, curr, ld);
+				ld->verify = save_verify;
+			}
+			header_inc = ld->dladdr - ld->header_addr + ld->max_length + 0x400;
+			header_max = ld->header_offset + header_inc + 0x400;
+			continue;
+		}
+		if ((ld->plugin & PLUGIN_IMAGE_FLAG_MASK) && (!curr->plug) && (!header_cnt)) {
+			header_cnt++;
+			header_max = ld->header_offset + ld->max_length + 0x400;
+			printf("header_max=%x\n", header_max);
+			header_inc = 4;
+		} else {
+			if (!ld->plugin)
+				curr->plug = 0;
+			if (curr->jump_mode == J_HEADER2) {
+				if (!found) {
+					found++;
+					ld->header_offset += ld->dladdr - ld->header_addr + ld->max_length;
+					header_inc = 0x400;
+					header_max = ld->header_offset + 0x400 * 128;
+					continue;
+				}
+			}
+			return 0;
+		}
+	}
+	printf("header not found %x:%x, %x\n", ld->header_offset, *(unsigned int *)p, ld->buf_cnt);
+	return -EINVAL;
+}
+
+static int do_download(struct sdp_dev *dev, struct sdp_work *curr, int verify)
+{
+	int ret;
+	struct load_desc ld = {0};
+
+	print_sdp_work(curr);
+	ld.curr = curr;
+	ld.verify = verify;
+	ld.xfile = fopen(curr->filename, "rb" );
+	if (!ld.xfile) {
+		printf("\nerror, can not open input file: %s\n", curr->filename);
+		return -5;
+	}
+	ld.buf_size = (1024*16);
+	ld.buf_start = malloc(ld.buf_size);
+	if (!ld.buf_start) {
+		printf("\nerror, out of memory\n");
+		ret = -2;
+		goto cleanup;
+	}
+	ld.fsize = get_file_size(ld.xfile);
+	ld.max_length = ld.fsize;
+	if (ld.max_length > curr->load_skip) {
+		ld.max_length -= curr->load_skip;
+	} else {
+		printf("error, skipping past end of file\n");
+		ret = -1;
+		goto cleanup;
+	}
+	if (curr->load_size && (ld.max_length > curr->load_size))
+		ld.max_length = curr->load_size;
+	if (curr->dcd || curr->clear_dcd || curr->plug || (curr->jump_mode >= J_HEADER)) {
+		ret = process_header(dev, curr, &ld);
+		if (ret < 0)
+			goto cleanup;
 		if ((!curr->jump_mode) && (!curr->plug)) {
 			/*  nothing else requested */
 			ret = 0;
 			goto cleanup;
 		}
 	} else {
-		dladdr = curr->load_addr;
-		printf("load_addr=%x\n", curr->load_addr);
-		header_addr = dladdr;
-		header_offset = 0;
+		ld.dladdr = curr->load_addr;
+		ld.header_addr = ld.dladdr + ld.max_length;
+		ld.header_offset = curr->load_skip + ld.max_length;
+		if (curr->jump_mode == J_ADDR_HEADER) {
+			unsigned cnt = ld.max_length;
+
+			init_header(dev, &ld);
+			/* If the header is at EOF, fsize needs increased */
+			ld.fsize += ld.max_length - cnt;
+			dbg_dump_long((unsigned char *)ld.writeable_header, ld.max_length - cnt, ld.header_addr, 0);
+		} else if (curr->jump_mode == J_ADDR_DIRECT) {
+			ld.header_addr = curr->jump_addr;
+			ld.header_offset = 0;
+		}
 	}
-	if (plugin && (!curr->plug)) {
+	if (ld.plugin && (!curr->plug)) {
 		printf("Only plugin header found\n");
 		ret = -1;
 		goto cleanup;
 	}
-	if (!dladdr) {
-		printf("\nunknown load address\r\n");
-		ret = -3;
-		goto cleanup;
-	}
-	file_base = header_addr - header_offset;
-	type = (curr->plug || curr->jump_mode) ? FT_APP : FT_LOAD_ONLY;
-	if (dev->mode == MODE_BULK) if (type == FT_APP) {
-		/* No jump command, dladdr should point to header */
-		dladdr = header_addr;
-	}
-	if (file_base > dladdr) {
-		max_length -= (file_base - dladdr);
-		dladdr = file_base;
-	}
-	skip = dladdr - file_base;
-	if ((int)skip > cnt) {
-		if (skip > fsize) {
-			printf("skip(0x%08x) > fsize(0x%08x) file_base=0x%08x, header_offset=0x%x\n", skip, fsize, file_base, header_offset);
-			ret = -4;
-			goto cleanup;
-		}
-		fseek(xfile, skip, SEEK_SET);
-		cnt -= skip;
-		fsize -= skip;
-		skip = 0;
-		cnt = fread(buf, 1 , BUF_SIZE, xfile);
-	}
-	p = &buf[skip];
-	cnt -= skip;
-	fsize -= skip;
-	if (fsize > max_length)
-		fsize = max_length;
-	if (verify) {
-		/*
-		 * we need to save header for verification
-		 * because some of the file is changed
-		 * before download
-		 */
-		verify_buffer = malloc(cnt);
-		verify_cnt = cnt;
-		if (!verify_buffer) {
-			printf("\r\nerror, out of memory\r\n");
-			ret = -2;
-			goto cleanup;
-		}
-		memcpy(verify_buffer, p, cnt);
-		if ((type == FT_APP) && (dev->mode != MODE_HID)) {
-			type = FT_LOAD_ONLY;
-			verify = 2;
-		}
-	}
-	printf("\nloading binary file(%s) to %08x, skip=%x, fsize=%x type=%x\r\n", curr->filename, dladdr, skip, fsize, type);
-	ret = load_file(dev, p, cnt, buf, BUF_SIZE,
-			dladdr, fsize, type, xfile);
-	if (ret < 0)
-		goto cleanup;
-	transferSize = ret;
-
-	if (verify) {
-		ret = verify_memory(dev, xfile, skip, dladdr, fsize, verify_buffer, verify_cnt);
+	ret = load_file_from_desc(dev, curr, &ld);
+	/*
+	 * Any command will initiate jump for bulk devices, no need to
+	 * explicitly send a jump command
+	 */
+	if (dev->mode == MODE_HID && (curr->plug || curr->jump_mode)) {
+		ret = jump(dev, ld.header_addr);
 		if (ret < 0)
 			goto cleanup;
-		if (verify == 2) {
-			if (verify_cnt > 64)
-				verify_cnt = 64;
-			ret = load_file(dev, verify_buffer, verify_cnt,
-					buf, BUF_SIZE, dladdr, verify_cnt,
-					FT_APP, xfile);
-			if (ret < 0)
-				goto cleanup;
-
-		}
 	}
-	if (dev->mode == MODE_HID) if (type == FT_APP) {
-		printf("jumping to 0x%08x\n", header_addr);
-		jump_command.addr = BE32(header_addr);
-		//Any command will initiate jump for mx51, jump address is ignored by mx51
-		retry = 0;
-		for (;;) {
-			err = dev->transfer(dev, 1, (unsigned char *)&jump_command, sizeof(jump_command), 0, &last_trans);
-			if (!err)
-				break;
-			printf("jump_command err=%i, last_trans=%i\n", err, last_trans);
-			if (retry > 5) {
-				return -4;
-			}
-			retry++;
-		}
-		memset(tmp, 0, sizeof(tmp));
-		err = dev->transfer(dev, 3, tmp, sizeof(tmp), 4, &last_trans);
-		if (err)
-			printf("j3 in err=%i, last_trans=%i  %02x %02x %02x %02x\n", err, last_trans, tmp[0], tmp[1], tmp[2], tmp[3]);
-		if (dev->mode == MODE_HID) {
-			memset(tmp, 0, sizeof(tmp));
-			err = dev->transfer(dev, 4, tmp, sizeof(tmp), 4, &last_trans);
-			if (tmp[0] || tmp[1] || tmp[2] || tmp[3])
-				printf("j4 in err=%i, last_trans=%i  %02x %02x %02x %02x\n", err, last_trans, tmp[0], tmp[1], tmp[2], tmp[3]);
 
-			// Ignore error. Documentation says "This report is sent by device only in case of an error jumping to the given address..."
-			err = 0;
-		}
-	}
-	ret = (fsize <= transferSize) ? 0 : -16;
 cleanup:
-	fclose(xfile);
-	free(verify_buffer);
-	free(buf);
+	fclose(ld.xfile);
+	free(ld.buf_start);
 	return ret;
+}
+
+int do_work(struct sdp_dev *p_id, struct sdp_work **work, int verify)
+{
+	struct sdp_work *curr = *work;
+	int err = 0;
+
+	err = do_status(p_id);
+	if (err) {
+		fprintf(stderr, "status failed\n");
+		return err;
+	}
+
+	while (curr) {
+		/* Do current job */
+		if (curr->mem)
+			perform_mem_work(p_id, curr->mem);
+		if (curr->filename[0])
+			err = do_download(p_id, curr, verify);
+		if (err) {
+			fprintf(stderr, "do_download failed, err=%d\n", err);
+			do_status(p_id);
+			break;
+		}
+
+		/* Check if more work is to do... */
+		if (!curr->next) {
+			/*
+			 * If only one job, but with a plug-in is specified
+			 * reexecute the same job, but this time download the
+			 * image. This allows to specify a single file with
+			 * plugin and image, and imx_usb will download & run
+			 * the plugin first and then the image.
+			 * NOTE: If the file does not contain a plugin,
+			 * DoIRomDownload->process_header will set curr->plug
+			 * to 0, so we won't download the same image twice...
+			 */
+			if (curr->plug) {
+				curr->plug = 0;
+			} else {
+				curr = NULL;
+				break;
+			}
+		} else {
+			curr = curr->next;
+		}
+
+		/*
+		 * Check if device is still here, otherwise return
+		 * with work (retry)
+		 */
+		err = do_status(p_id);
+		if (err < 0) {
+			err = 0;
+			break;
+		}
+	}
+
+	*work = curr;
+
+	return err;
 }
 
