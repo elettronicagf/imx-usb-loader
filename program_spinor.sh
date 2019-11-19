@@ -4,7 +4,7 @@ function print_usage()
 {
 	 	echo "program_spinor v.$version"
  		echo "Usage: `basename $0` bootloader_version wid"
- 		echo "Example: `basename $0` 0508-001 0508aa0101"
+ 		echo "Example: `basename $0` 0659-001 0659aa0101"
 		exit $E_BADARGS
 }
 if [ $# -ne 2 ]
@@ -16,12 +16,12 @@ bv=$1
 wid=$2
 uboot_bin_dir=../u-boot/binaries
 
-if [ $wid == '0571aa0101' ] || [ $wid == '0571ab0101' ]
-then
-	cpu_type='mx6ul'
-elif [ $wid == '0571ac0101' ]  || [ $wid == '0571ad0101' ] || [ $wid == '0571ag0101' ] || [ $wid == '0571ah0101' ] || [ $wid == '0571ai0101' ] 
+if [ $wid == '0659aa0101' ] 
 then
 	cpu_type='mx6ull'
+elif [ $wid == '0659xx0101' ]  
+then
+	cpu_type='mx6ul'
 else
 	echo "Unsupported WID: $wid"
 	exit
